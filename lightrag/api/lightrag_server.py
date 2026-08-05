@@ -17,6 +17,7 @@ import logging
 import logging.config
 import sys
 import textwrap
+import time
 import uuid
 import uvicorn
 import pipmaster as pm
@@ -35,8 +36,11 @@ from lightrag.api.utils_api import (
     check_env_file,
     internal_server_error,
 )
+from lightrag.api.admission_middleware import AdmissionMiddleware
+from lightrag.api.body_limit_middleware import BodyLimitMiddleware, resolve_body_limits
 from .config import (
     global_args,
+    normalize_api_prefix,
     update_uvicorn_mode_config,
     get_default_host,
     resolve_asymmetric_embedding_opt_in,
@@ -75,7 +79,10 @@ from lightrag.kg.shared_storage import (
     cleanup_keyed_lock,
     drain_reserved_background_tasks,
     finalize_share_data,
+    get_pipeline_ingress,
 )
+from lightrag import pipeline_metrics
+from lightrag.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
 from lightrag.api.login_rate_limit import LoginRateLimiter
@@ -392,24 +399,6 @@ def _inject_swagger_theme(html: str, theme: str) -> str:
 # and matches how LightRAG is deployed in practice. See
 # docs/MultiSiteDeployment.md.
 WEBUI_PATH = "/webui"
-
-
-def _normalize_api_prefix(value: str | None) -> str:
-    """Canonicalize an API prefix before handing it to FastAPI's ``root_path``.
-
-    Strips surrounding whitespace, ensures a leading slash, drops a trailing
-    slash, and treats empty/"/" as "no prefix". Raw CLI/env input like
-    ``"site01"`` or ``"/site01/"`` would otherwise feed an invalid form to
-    FastAPI and to the WebUI prefix injection.
-    """
-    if value is None:
-        return ""
-    value = value.strip()
-    if not value or value == "/":
-        return ""
-    if not value.startswith("/"):
-        value = "/" + value
-    return value.rstrip("/")
 
 
 class _RootPathNormalizationMiddleware:
@@ -1205,6 +1194,64 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+def _build_capability_status(rag) -> dict:
+    """Strict-capability report, or ``{}`` when it cannot be determined.
+
+    /health is a liveness probe first: one unavailable diagnostic must never turn
+    it into a 500.
+    """
+    doc_status = getattr(rag, "doc_status", None)
+    if doc_status is None:
+        return {}
+    try:
+        return describe_doc_status_capabilities(doc_status)
+    except Exception as capability_error:  # pragma: no cover - defensive
+        logger.debug(f"Capability probe unavailable for /health: {capability_error}")
+        return {}
+
+
+def _build_scheduling_status(pipeline_snapshot: dict, ingress_counts: dict) -> dict:
+    """Curated scheduling/observability view for /health (LR2 Phase 6 items 2/4).
+
+    Answers the questions an operator actually has during a manual retry or a
+    scan: which phase the manual channel is in, which request holds the freeze
+    and since when, what the drain is still waiting for, and how full the sticky
+    channel is. The manual owner's ``owner_token`` is omitted on purpose — it
+    authorizes releasing a reservation, so publishing it would turn a status page
+    into a control surface.
+    """
+    owner = pipeline_snapshot.get("manual_owner") or {}
+    freeze_started = pipeline_snapshot.get("manual_freeze_started_at")
+    freeze_seconds = None
+    if isinstance(freeze_started, (int, float)) and freeze_started > 0:
+        # Wall clock, because the freeze may be held by another process; a
+        # negative value (clock stepped back) is reported as 0 rather than as a
+        # nonsensical duration.
+        freeze_seconds = max(0.0, round(time.time() - float(freeze_started), 3))
+    pending_enqueues = int(pipeline_snapshot.get("pending_enqueues", 0) or 0)
+    return {
+        "manual_phase": pipeline_snapshot.get("manual_phase") or "idle",
+        "manual_freeze_requested": bool(
+            pipeline_snapshot.get("manual_freeze_requested", False)
+        ),
+        "manual_resetting": bool(pipeline_snapshot.get("manual_resetting", False)),
+        "manual_freeze_seconds": freeze_seconds,
+        "manual_owner_request_id": (
+            owner.get("request_id") if isinstance(owner, dict) else None
+        ),
+        "manual_owner_pid": owner.get("pid") if isinstance(owner, dict) else None,
+        # What a DRAIN_TO_IDLE is still waiting for: reservations whose rows are
+        # not written yet, plus whether a processing run still holds busy.
+        "drain_pending_enqueues": pending_enqueues,
+        "drain_waiting_on_workers": bool(pipeline_snapshot.get("busy", False)),
+        "manual_retries_queued": ingress_counts.get("manual_retries"),
+        "manual_retries_capacity": ingress_counts.get("manual_retries_capacity"),
+        "document_notifications_queued": ingress_counts.get("documents"),
+        "document_notification_overflows": ingress_counts.get("document_overflows"),
+        "auto_rescan_pending": ingress_counts.get("auto_rescan_pending"),
+    }
+
+
 def create_app(args):
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
@@ -1291,6 +1338,26 @@ def create_app(args):
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
 
+            # Admission control needs a doc_status backend that can count
+            # strictly (LR2 §9.1). Probe once here so an unsupported backend
+            # fails at startup instead of turning every upload into a 503.
+            if getattr(rag, "max_pending_documents", 0) > 0:
+                from lightrag.utils_pipeline import count_active_documents
+
+                try:
+                    active_now = await count_active_documents(rag.doc_status)
+                except Exception as admission_probe_error:
+                    raise RuntimeError(
+                        "MAX_PENDING_DOCUMENTS is set but the configured "
+                        f"doc_status backend cannot count strictly: "
+                        f"{admission_probe_error}"
+                    ) from admission_probe_error
+                logger.info(
+                    f"Admission control enabled: capacity "
+                    f"{rag.max_pending_documents}, {active_now} document(s) "
+                    "currently active"
+                )
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
@@ -1332,7 +1399,7 @@ def create_app(args):
 
     # The WebUI mount path is fixed at "/webui" — see
     # docs/MultiSiteDeployment.md for the rationale.
-    api_prefix = _normalize_api_prefix(getattr(args, "api_prefix", None))
+    api_prefix = normalize_api_prefix(getattr(args, "api_prefix", None))
     webui_path = WEBUI_PATH
 
     app_kwargs = {
@@ -1425,6 +1492,36 @@ def create_app(args):
     # docstring.
     if api_prefix:
         app.add_middleware(_RootPathNormalizationMiddleware)
+
+    # Pre-body admission control (LR2 §9.3). Installed only when there is a
+    # capacity to enforce; the ingestion routes keep their own reservation, so an
+    # absent middleware costs economy (the body is read before the refusal), not
+    # correctness. ``rag`` is built further down in this function, hence the lazy
+    # getter.
+    #
+    # Added BEFORE the CORS middleware on purpose: the most recently added
+    # middleware runs outermost, so CORS ends up wrapping this one and its 401 /
+    # 429 responses carry the CORS headers a browser needs to read the status
+    # (without them the WebUI would see an opaque network error instead of "at
+    # capacity"). It therefore also sees the un-normalized path, which is why it
+    # strips ``api_prefix`` itself.
+    if args.max_pending_documents > 0:
+        app.add_middleware(
+            AdmissionMiddleware,
+            rag_getter=lambda: rag,
+            api_key=api_key,
+            api_prefix=api_prefix,
+        )
+
+    # Raw request-body ceilings (GHSA-r8jh-295g-vv42). Added AFTER the admission
+    # middleware so it ends up outside it: an oversized body is then refused
+    # before it can take a capacity slot, and the reservation a mid-body 413
+    # would otherwise strand is released by admission's own finally block as the
+    # exception travels back out. Still added before CORS, for the same reason
+    # admission is — a browser has to be able to read the 413.
+    body_limits = resolve_body_limits(args)
+    if body_limits is not None:
+        app.add_middleware(BodyLimitMiddleware, api_prefix=api_prefix, **body_limits)
 
     # Add CORS middleware
     cors_origins = get_cors_origins()
@@ -1840,6 +1937,9 @@ def create_app(args):
                 ) -> str:
                     if history_messages is None:
                         history_messages = []
+                    # Server-configured timeout overrides any caller-passed value,
+                    # matching the OpenAI/Azure/Gemini role wrappers.
+                    kwargs["timeout"] = role_timeout
                     if role_provider_options:
                         kwargs = {**role_provider_options, **kwargs}
                     return await bedrock_complete_if_cache(
@@ -1967,6 +2067,9 @@ def create_app(args):
         # which drops them and emits deprecation warnings when booleans are set.
         if config_cache.bedrock_llm_options:
             kwargs = {**config_cache.bedrock_llm_options, **kwargs}
+        # Server-configured timeout overrides any caller-passed value, matching
+        # the OpenAI wrapper (create_optimized_openai_llm_func).
+        kwargs["timeout"] = llm_timeout
 
         return await bedrock_complete_if_cache(
             args.llm_model,
@@ -2122,6 +2225,9 @@ def create_app(args):
             summary_context_size=args.summary_context_size,
             chunk_token_size=int(args.chunk_size),
             chunk_overlap_token_size=int(args.chunk_overlap_size),
+            embedding_chunk_overlap_token_size=int(
+                args.embedding_chunk_overlap_token_size
+            ),
             llm_model_kwargs=create_llm_model_kwargs(
                 args.llm_binding, args, llm_timeout
             ),
@@ -2142,6 +2248,9 @@ def create_app(args):
             rerank_model_max_async=args.rerank_max_async,
             default_rerank_timeout=args.rerank_timeout,
             max_parallel_insert=args.max_parallel_insert,
+            pipeline_scheduling_page_size=args.pipeline_scheduling_page_size,
+            pipeline_require_strict_storage_reads=args.pipeline_require_strict_storage_reads,
+            max_pending_documents=args.max_pending_documents,
             max_graph_nodes=args.max_graph_nodes,
             addon_params=addon_params,
             ollama_server_infos=ollama_server_infos,
@@ -2444,6 +2553,17 @@ def create_app(args):
                 or pipeline_pending_enqueues > 0
             )
 
+            # Ingress channel depths (bounded counters only — never the
+            # messages). Best-effort: a mailbox that is not bootstrapped yet must
+            # not turn a liveness probe into a 500.
+            ingress_counts: dict[str, Any] = {}
+            try:
+                ingress_counts = dict(
+                    (await get_pipeline_ingress(workspace)).counts() or {}
+                )
+            except Exception as ingress_error:
+                logger.debug(f"Ingress counts unavailable for /health: {ingress_error}")
+
             if not auth_configured:
                 auth_mode = "disabled"
             else:
@@ -2538,6 +2658,20 @@ def create_app(args):
                     "pipeline_scanning": pipeline_scanning,
                     "pipeline_destructive_busy": pipeline_destructive_busy,
                     "pipeline_pending_enqueues": pipeline_pending_enqueues,
+                    # Curated scheduling view (LR2 Phase 6 items 2 & 4). The raw
+                    # manual_* fields stay hidden from /pipeline_status — they are
+                    # coordination internals — but an operator watching a freeze
+                    # needs to see WHICH request holds it, for how long, and what
+                    # the drain is still waiting for. The owner token is
+                    # deliberately omitted: it is a capability, not a status.
+                    "scheduling": _build_scheduling_status(
+                        pipeline_snapshot, ingress_counts
+                    ),
+                    "capabilities": _build_capability_status(rag),
+                    # Per-worker counters/durations for the paths the bounded
+                    # rework introduced (LR2 Phase 6 item 3); see
+                    # lightrag/pipeline_metrics.py for the boundary.
+                    "scheduling_metrics": pipeline_metrics.snapshot(),
                     "keyed_locks": keyed_lock_info,
                     "llm_queue_status": await rag.get_llm_queue_status(
                         include_base=True
