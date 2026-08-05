@@ -57,6 +57,7 @@ api = [
     "aiohttp",
     "configparser",
     "json_repair>=0.59.9,<1.0.0",
+    "minio>=7.2",
     "nano-vectordb",
     "networkx",
     "numpy>=1.24.0,<3.0.0",
