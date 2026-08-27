@@ -1057,9 +1057,11 @@ class RedisDocStatusStorage(DocStatusStorage):
 
         Single source of the decoded-JSON -> status construction shared by
         ``get_docs_by_statuses`` and the ``get_full_docs_by_ids`` hydration
-        path. Raises ``KeyError``/``TypeError`` on a malformed row (``TypeError``
-        is what ``DocProcessingStatus(**data)`` raises on missing required
+        path. Raises ``KeyError``/``TypeError`` on a malformed row
+        (``TypeError`` is what construction raises on missing required
         fields); the caller decides strict (raise) vs relaxed (skip).
+        Fields the dataclass does not declare are tolerated — see
+        ``DocProcessingStatus.from_stored``.
         """
         data = data.copy()
         data.pop("content", None)
@@ -1069,7 +1071,7 @@ class RedisDocStatusStorage(DocStatusStorage):
             data["metadata"] = {}
         if "error_msg" not in data:
             data["error_msg"] = None
-        return DocProcessingStatus(**data)
+        return DocProcessingStatus.from_stored(data)
 
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus], strict: bool = False
@@ -1160,37 +1162,41 @@ class RedisDocStatusStorage(DocStatusStorage):
 
                         # Filter by track_id and create DocProcessingStatus objects
                         for key, value in zip(keys, values):
-                            if value:
-                                try:
-                                    doc_data = json.loads(value)
-                                    if doc_data.get("track_id") == track_id:
-                                        # Extract document ID from key
-                                        doc_id = key.split(":", 1)[1]
-
-                                        # Make a copy of the data to avoid modifying the original
-                                        data = doc_data.copy()
-                                        # Remove deprecated content field if it exists
-                                        data.pop("content", None)
-                                        # If file_path is not in data, use document id as file path
-                                        if "file_path" not in data:
-                                            data["file_path"] = "no-file-path"
-                                        # Ensure new fields exist with default values
-                                        if "metadata" not in data:
-                                            data["metadata"] = {}
-                                        if "error_msg" not in data:
-                                            data["error_msg"] = None
-
-                                        result[doc_id] = DocProcessingStatus(**data)
-                                except (json.JSONDecodeError, KeyError) as e:
-                                    logger.error(
-                                        f"[{self.workspace}] Error processing document {key}: {e}"
-                                    )
+                            if not value:
+                                continue
+                            try:
+                                doc_data = json.loads(value)
+                                if doc_data.get("track_id") != track_id:
                                     continue
+                                # Extract document ID from key
+                                doc_id = key.split(":", 1)[1]
+                                result[doc_id] = (
+                                    self._redis_doc_processing_status_from_data(
+                                        doc_data
+                                    )
+                                )
+                            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                                # TypeError is what DocProcessingStatus(**data)
+                                # actually raises on missing required fields —
+                                # without it the relaxed skip-and-log contract
+                                # would escape to the outer handler below, which
+                                # abandons the SCAN and returns a silently
+                                # TRUNCATED listing for the whole track_id.
+                                logger.error(
+                                    f"[{self.workspace}] Error processing document {key}: {e}"
+                                )
+                                continue
 
                     if cursor == 0:
                         break
             except Exception as e:
-                logger.error(f"[{self.workspace}] Error getting docs by track_id: {e}")
+                # Transport-level failure only (hydration errors are handled
+                # per-document above): the SCAN is abandoned, so say plainly
+                # that what we return is partial.
+                logger.error(
+                    f"[{self.workspace}] Error getting docs by track_id — result is "
+                    f"incomplete ({len(result)} documents collected): {e}"
+                )
 
         return result
 
@@ -1567,7 +1573,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                                     else:
                                         sort_key = data.get(sort_field, "")
 
-                                    doc_status = DocProcessingStatus(**data)
+                                    doc_status = DocProcessingStatus.from_stored(data)
                                     all_docs.append((doc_id, doc_status, sort_key))
 
                                 except (json.JSONDecodeError, KeyError) as e:

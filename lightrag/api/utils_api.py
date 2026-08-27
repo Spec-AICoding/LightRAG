@@ -724,16 +724,21 @@ def display_splash_screen(args: argparse.Namespace) -> None:
 
     # Server Access Information
     protocol = "https" if args.ssl else "http"
+    api_docs_enabled = bool(getattr(args, "enable_api_docs", True))
     if args.host == "0.0.0.0":
         ASCIIColors.magenta("\n🌐 Server Access Information:")
         ASCIIColors.white("    ├─ WebUI (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}")
         ASCIIColors.white("    ├─ Remote Access: ", end="")
         ASCIIColors.yellow(f"{protocol}://<your-ip-address>:{args.port}")
-        ASCIIColors.white("    ├─ API Documentation (local): ", end="")
-        ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
-        ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
+        if api_docs_enabled:
+            ASCIIColors.white("    ├─ API Documentation (local): ", end="")
+            ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
+            ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
+            ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
+        else:
+            ASCIIColors.white("    └─ API Documentation: ", end="")
+            ASCIIColors.yellow("disabled (ENABLE_API_DOCS=false)")
 
         ASCIIColors.magenta("\n📝 Note:")
         ASCIIColors.cyan("""    Since the server is running on 0.0.0.0:
@@ -748,10 +753,14 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.magenta("\n🌐 Server Access Information:")
         ASCIIColors.white("    ├─ WebUI (local): ", end="")
         ASCIIColors.yellow(f"{base_url}")
-        ASCIIColors.white("    ├─ API Documentation: ", end="")
-        ASCIIColors.yellow(f"{base_url}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation: ", end="")
-        ASCIIColors.yellow(f"{base_url}/redoc")
+        if api_docs_enabled:
+            ASCIIColors.white("    ├─ API Documentation: ", end="")
+            ASCIIColors.yellow(f"{base_url}/docs")
+            ASCIIColors.white("    └─ Alternative Documentation: ", end="")
+            ASCIIColors.yellow(f"{base_url}/redoc")
+        else:
+            ASCIIColors.white("    └─ API Documentation: ", end="")
+            ASCIIColors.yellow("disabled (ENABLE_API_DOCS=false)")
 
     # Security Notice
     if args.key:
@@ -823,6 +832,7 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     """)
 
     _warn_about_body_limits(args)
+    _warn_about_svg_rasterizer()
 
     # Ensure splash output flush to system log
     sys.stdout.flush()
@@ -866,4 +876,29 @@ def _warn_about_body_limits(args) -> None:
         ASCIIColors.white("""    MAX_UPLOAD_SIZE is unset or unlimited, so /documents/upload has no raw
     request-body ceiling to derive and accepts a body of any size. Set
     MAX_UPLOAD_SIZE to the largest file you intend to accept.
+    """)
+
+
+def _warn_about_svg_rasterizer() -> None:
+    """Flag a missing/broken cairosvg->libcairo rasterization path.
+
+    ``cairosvg`` is a cffi binding: ``pip install cairosvg`` always succeeds,
+    but rendering only works if the native ``libcairo`` shared library is also
+    present on the host, which pip/uv cannot install. Without it, SVG images in
+    markdown/textpack documents are silently skipped (the rest of the document
+    is unaffected) — surfacing the gap here, once, is cheaper for an operator
+    to notice than a per-document warning buried in later processing logs.
+    """
+    from lightrag.parser.markdown.parser import check_svg_rasterizer
+
+    error = check_svg_rasterizer()
+    if error is None:
+        return
+    ASCIIColors.yellow("\n⚠️  SVG Rasterization Warning:")
+    ASCIIColors.white(f"""    {error}
+    Install the native libcairo library to fix this:
+      Debian/Ubuntu : sudo apt-get install -y libcairo2
+      RHEL/Fedora   : sudo dnf install -y cairo
+      macOS         : brew install cairo
+      Windows       : install the GTK3 runtime (bundles libcairo-2.dll)
     """)

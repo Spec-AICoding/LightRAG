@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 import os
 from dotenv import load_dotenv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import (
     Any,
     ClassVar,
@@ -225,20 +225,23 @@ class StorageNameSpace(ABC):
 
 @dataclass
 class BaseVectorStorage(StorageNameSpace, ABC):
-    embedding_func: EmbeddingFunc
+    requires_embedding_func: ClassVar[bool] = True
+
+    embedding_func: EmbeddingFunc | None
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
 
     def _validate_embedding_func(self):
-        """Validate that embedding_func is provided.
+        """Validate the backend's embedding function requirement.
 
         This method should be called at the beginning of __post_init__
-        in all vector storage implementations.
+        in all vector storage implementations. Backends that never materialize
+        vectors may set ``requires_embedding_func`` to ``False``.
 
         Raises:
-            ValueError: If embedding_func is None
+            ValueError: If the backend requires embedding_func and it is None
         """
-        if self.embedding_func is None:
+        if self.requires_embedding_func and self.embedding_func is None:
             raise ValueError(
                 "embedding_func is required for vector storage. "
                 "Please provide a valid EmbeddingFunc instance."
@@ -574,6 +577,19 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Returns:
             A list of (source_id, target_id) tuples representing edges,
             or None if the node doesn't exist
+
+        Three outcomes, three answers — implementations must not merge them:
+
+        * ``[]``   — the node exists and has no relations.
+        * ``None`` — the node is **confirmed absent**.
+        * raise    — the backend could not answer. A transport/server error is
+          neither of the above; reporting it as ``[]`` or ``None`` turns an
+          unknown into a fact that callers (entity merge/dedup, graph edits)
+          act on. Same rule as :meth:`BaseKVStorage.get_by_id_strict`.
+
+        ``get_nodes_edges_batch`` cannot express the middle case (it returns a
+        dict of lists) and flattens ``None`` to ``[]`` by design; callers that
+        need the distinction must use this single-node form.
         """
 
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
@@ -659,6 +675,41 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         1. Changes will be persisted to disk during the next index_done_callback
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
+
+        Attribute contract (applies to ``upsert_edge`` and the batch variants
+        too):
+            Every value must be a storable scalar -- ``str``
+            (XML-compatible), ``int``, finite ``float``, or ``bool``. Nothing
+            else: no nested containers, and no ``None``. Attribute names must
+            not contain ``"."`` or start with ``"$"``.
+
+            This is the intersection of what the registered backends can carry,
+            and callers are responsible for it because the backends disagree on
+            what happens when it is violated. The same non-scalar is refused by
+            the Neo4j driver, stored verbatim by MongoDB and by
+            PostgreSQL's ``jsonb`` column, and fatal to GraphML serialization;
+            ``None`` deletes the property on the Cypher backends but is a hard
+            error on NetworkX. ``lightrag.utils.validate_graph_attributes``
+            is the shared enforcement point -- prefer it over re-deriving the
+            rule per backend.
+
+            This is a **caller** contract, enforced where input enters the
+            system. An implementation should reject only what *it* cannot store,
+            which may be less: ``NetworkXStorage`` accepts ``NaN`` and integers
+            past int64 because GraphML round-trips them, even though the Neo4j
+            driver cannot pack either.
+
+            That asymmetry is deliberate, and the reason is the same for names
+            and values. Every rewrite path (entity edit, rename, merge,
+            extraction rebuild) spreads a fetched object's stored attributes back
+            into the upsert payload, and a workspace can already hold values or
+            names that predate this contract -- the manual edit API accepted
+            anything before its field allowlist landed. An implementation that
+            enforced the full contract on a rewrite would make those objects
+            permanently unmodifiable, gaining nothing it could not already store.
+            So: ``lightrag.utils.graph_attribute_value_rejection`` at the
+            ingress, ``xml_attribute_value_rejection`` (or the equivalent for
+            that store) inside it.
 
         Args:
             node_id: The ID of the node to insert or update
@@ -792,6 +843,83 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Returns:
             KnowledgeGraph object containing nodes and edges, with an is_truncated flag
             indicating whether the graph was truncated due to max_nodes limit
+
+        Ranks by node degree, descending, and **ties break on the label,
+        ascending** — the same tie-break :meth:`get_popular_labels` documents,
+        for the same reason. Degree alone does not order a real graph: leaf
+        entities of degree 1 or 2 outnumber everything else, so the ``max_nodes``
+        cutoff almost always lands inside a band of equal-degree entities, and
+        whatever orders that band decides which nodes the caller ever sees.
+        Left to the backend's natural order that is node INSERTION order (a
+        stable sort in Python, an unconstrained plan order in SQL/Cypher), so
+        re-ingesting the same corpus with the documents in a different order
+        returned a different graph at the same ``max_nodes`` — the defect fixed
+        for ``get_popular_labels`` first, then here.
+
+        Order the labels by code point (SQL ``COLLATE "C"``, not a locale
+        collation) so every backend agrees with Python's ``str`` comparison.
+
+        **Scope: the ``*`` whole-graph ranking.** The non-wildcard path -- BFS
+        expansion from a start ``node_label`` -- is deliberately NOT bound by
+        it, and a backend that admits same-depth nodes in traversal order there
+        is compliant. Only one level of that path could ever be affected: once
+        ``max_nodes`` is filled no deeper level contributes a node at all, so
+        the rule would decide nothing beyond which same-depth neighbours of the
+        single straddling level survive.
+
+        Buying that decision is not worth its price. The only caller is the
+        graph view (``GET /graphs``), whose consumer treats ``nodes`` and
+        ``edges`` as sets: the WebUI recomputes each node's degree from the
+        returned edges to size it and never reads the order a backend produced.
+        Against that, ranking a level requires seeing the whole level AND its
+        global degrees before the cap, which on a graph database costs the
+        traversal's early exit (the cap can no longer stop the expansion), a
+        degree count over the entire reached neighbourhood, and -- once the
+        surviving set is no longer the traversal's own subgraph -- a second,
+        unbounded relationship match to rebuild the edges. Those are real
+        query-plan costs paid on every truncated view, in exchange for a
+        marginally better neighbour choice in one level that the consumer
+        cannot distinguish.
+
+        Level-internal admission order is therefore backend-defined. Backends
+        where the ranking is a local sort pay approximately nothing and do
+        apply it: :class:`~lightrag.kg.networkx_impl.NetworkXStorage` and
+        :class:`~lightrag.kg.pgtable_impl.PGTableGraphStorage` order every
+        level, while ``MongoGraphStorage`` (default ``bidirectional`` mode) and
+        :class:`~lightrag.kg.opensearch_impl.OpenSearchGraphStorage` rank the
+        level straddling the cap, gated on overflow so a subgraph that fits
+        pays nothing at all. Neo4j, Memgraph and ``PGGraphStorage`` (Apache AGE)
+        admit in traversal order. A new backend should rank its levels where
+        its query language makes that free, and is under no obligation to
+        reshape a traversal to achieve it.
+        This is the resolution of issue #3612, not an outstanding gap in it.
+
+        **Known deviation -- PGGraphStorage (Apache AGE)** ranks the ``*`` view
+        on ``degree DESC, v.id ASC``, the internal vertex id, not the label.
+        Selecting only ``v.id`` lets the vertex scan be index-only; the label
+        lives in the vertex ``properties``, so ordering on it forces a full heap
+        read (~1.5x buffers, ~25% wall clock on a 200k-vertex/600k-edge graph),
+        and no index removes that -- the ORDER BY leads with an aggregate
+        computed from the edge table. The id is an insertion counter, so that
+        backend's view is stable for a given database but still varies with
+        ingestion order across databases holding the same graph, and its
+        :meth:`get_popular_labels` (which DOES order by label) can disagree with
+        its graph view at the same cutoff. Every other backend orders its ``*``
+        ranking on the label; do not copy the deviation into a new one.
+
+        **Known approximation -- OpenSearchGraphStorage** applies the rule, but
+        only to the candidates its degree aggregations surfaced, and that set is
+        approximate: the two endpoint aggregations are each capped at
+        ``max_nodes``, so an entity whose in- and out-degree both fall outside
+        their respective top-N never reaches the ranking however high its
+        undirected degree is, and terms aggregations are count-approximate
+        across shards. Tracked in issue #3613; it needs a storage-shape change,
+        not an ordering one.
+
+        This constrains WHICH nodes survive truncation, not the order of
+        :class:`KnowledgeGraph.nodes` in the response — implementations
+        materialize that list from a dict or a subgraph view, and callers that
+        need a specific presentation order must sort it themselves.
         """
 
     @abstractmethod
@@ -820,6 +948,39 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Returns:
             List of labels sorted by degree (highest first)
+
+        Ranks the WHOLE node set: an isolated (degree-0) entity ranks last, but
+        it still ranks. Implementations that derive degrees from their edge
+        store must therefore not let a node absent from that store fall out of
+        the result. Ties break on the label, ascending.
+
+        The expected shape is two phases, because the second one almost never
+        runs. Rank the entities that HAVE edges first — the cheap path, and any
+        graph with more than ``limit`` connected entities fills every slot there
+        — then top the result up from the isolated entities only when that comes
+        up short. The top-up is bounded by the shortfall (never more than
+        ``limit`` rows), which is what keeps it affordable even where it means a
+        sequential scan of the node store. Coming up short also means the
+        connected set is now known in full, so every remaining entity is
+        isolated by definition.
+
+        Driving the whole ranking off the node store instead is simpler to
+        write and gives the same answer, but it pays a full pass over the nodes
+        on every call — on a large graph, to produce a result the first phase
+        already had.
+
+        The result is best-effort about the reverse direction: a backend that
+        derives degrees from its edge store MAY also surface an id that has
+        edges but no node document. Only a data-quality defect produces one —
+        the write paths materialize both endpoints of every edge — and
+        confirming every ranked id against the node store would cost a join or
+        an extra round trip on a hot, interactive endpoint. Callers must
+        therefore tolerate a returned label whose :meth:`get_node` comes back
+        empty, rather than assume every label resolves.
+
+        An empty list means the graph holds no entities. A backend error MUST
+        raise instead — ``/graph/label/popular`` renders both, and the two are
+        indistinguishable to the user once the error is swallowed.
         """
 
     @abstractmethod
@@ -832,6 +993,10 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Returns:
             List of matching labels sorted by relevance
+
+        As with :meth:`get_popular_labels`, an empty list means "nothing
+        matched" — a backend error MUST raise rather than return it. A blank
+        query is a real empty result, not an error.
         """
 
 
@@ -864,7 +1029,9 @@ class DocProcessingStatus:
     Always a hint-stripped basename (e.g. ``abc.docx``) or the literal
     ``"unknown_source"`` sentinel; never carries directory components or
     parser ``[hint]`` segments. UI display, filename-based dedup, and
-    citation paths all share this value.
+    citation paths all share this value. Duplicate-attempt rows deliberately
+    reuse the primary document's basename, so this field is not a unique key
+    and does not by itself prove ownership of a physical source file.
     """
     status: DocStatus
     """Current processing status"""
@@ -907,6 +1074,25 @@ class DocProcessingStatus:
                 and self.status == DocStatus.PROCESSED
             ):
                 self.status = DocStatus.PREPROCESSED
+
+    @classmethod
+    def from_stored(cls, data: dict[str, Any]) -> "DocProcessingStatus":
+        """Construct from a stored doc_status row, ignoring undeclared fields.
+
+        Producers evolve independently of this schema: RAG-Anything writes
+        ``scheme_name``/``multimodal_content``, other LightRAG versions write
+        fields an installed release does not declare yet (or no longer does).
+        ``DocProcessingStatus(**row)`` raises ``TypeError`` on any such field,
+        which makes every read path treat the row as malformed and drop it
+        from listings — the document silently disappears from the WebUI and
+        the API even though its record is intact (HKUDS/RAG-Anything#73).
+
+        Extra fields are ignored for construction only; the stored row is
+        not modified. A *missing required* field still raises ``TypeError``
+        — tolerance is strictly for extras, not for malformed rows.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 class CursorPosition:
@@ -1581,6 +1767,7 @@ class DeletionResult:
     message: str
     status_code: int = 200
     file_path: str | None = None
+    """Canonical source basename; another status row may reference it too."""
 
 
 # Unified Query Result Data Structures for Reference List Support

@@ -872,8 +872,12 @@ class Neo4JStorage(BaseGraphStorage):
             pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
 
         Returns:
-            A dictionary mapping (src, tgt) tuples to their edge properties.
+            A dictionary mapping existing (src, tgt) tuples to their edge
+            properties. Missing pairs are omitted.
         """
+        if not pairs:
+            return {}
+
         workspace_label = self._get_workspace_label()
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
@@ -889,26 +893,19 @@ class Neo4JStorage(BaseGraphStorage):
                 src = record["src_id"]
                 tgt = record["tgt_id"]
                 edges = record["edges"]
-                if edges and len(edges) > 0:
-                    edge_props = edges[0]  # choose the first if multiple exist
-                    # Ensure required keys exist with defaults
-                    for key, default in {
-                        "weight": 1.0,
-                        "source_id": None,
-                        "description": None,
-                        "keywords": None,
-                    }.items():
-                        if key not in edge_props:
-                            edge_props[key] = default
-                    edges_dict[(src, tgt)] = edge_props
-                else:
-                    # No edge found – set default edge properties
-                    edges_dict[(src, tgt)] = {
-                        "weight": 1.0,
-                        "source_id": None,
-                        "description": None,
-                        "keywords": None,
-                    }
+                # MATCH only emits records for existing relationships, so the
+                # aggregate always contains at least one relationship.
+                edge_props = dict(edges[0])  # choose the first if multiple exist
+                # Ensure required keys exist with defaults
+                for key, default in {
+                    "weight": 1.0,
+                    "source_id": None,
+                    "description": None,
+                    "keywords": None,
+                }.items():
+                    if key not in edge_props:
+                        edge_props[key] = default
+                edges_dict[(src, tgt)] = edge_props
             await result.consume()
             return edges_dict
 
@@ -921,7 +918,9 @@ class Neo4JStorage(BaseGraphStorage):
 
         Returns:
             list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
-            None: If no edges found
+            None: If the node does not exist. An existing node with no relations
+                returns ``[]`` — the BaseGraphStorage contract, as implemented by
+                NetworkXStorage. A query error is neither value: it propagates.
 
         Raises:
             ValueError: If source_node_id is invalid
@@ -941,7 +940,14 @@ class Neo4JStorage(BaseGraphStorage):
                     results = await session.run(query, entity_id=source_node_id)
 
                     edges = []
+                    # Any row at all means the anchor MATCH bound n, i.e. the
+                    # node exists: an isolated node still yields exactly one row
+                    # (via OPTIONAL MATCH) carrying a NULL connected node. Zero
+                    # rows is the only "no such node" signal, and it must not be
+                    # reported as an empty edge list.
+                    node_matched = False
                     async for record in results:
+                        node_matched = True
                         source_node = record["n"]
                         connected_node = record["connected"]
 
@@ -964,7 +970,7 @@ class Neo4JStorage(BaseGraphStorage):
                             edges.append((source_label, target_label))
 
                     await results.consume()  # Ensure results are consumed
-                    return edges
+                    return edges if node_matched else None
                 except Exception as e:
                     logger.error(
                         f"[{self.workspace}] Error getting edges for node {source_node_id}: {str(e)}"
@@ -1337,12 +1343,16 @@ class Neo4JStorage(BaseGraphStorage):
                         if count_result:
                             await count_result.consume()
 
-                    # Run main query to get nodes with highest degree
+                    # Run main query to get nodes with highest degree.
+                    # Degree descending, then entity_id ascending: the tie-break
+                    # is the BaseGraphStorage contract, and without it the
+                    # LIMIT cut an unordered band of equal-degree entities, so
+                    # the same graph returned different nodes run to run.
                     main_query = f"""
                     MATCH (n:`{workspace_label}`)
                     OPTIONAL MATCH (n)-[r]-()
                     WITH n, COALESCE(count(r), 0) AS degree
-                    ORDER BY degree DESC
+                    ORDER BY degree DESC, n.entity_id ASC
                     LIMIT $max_nodes
                     WITH collect({{node: n}}) AS filtered_nodes
                     UNWIND filtered_nodes AS node_info

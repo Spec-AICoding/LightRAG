@@ -14,6 +14,7 @@ Two contracts introduced for the pipeline scheduling control-plane:
 """
 
 import asyncio
+from collections import Counter
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -627,8 +628,10 @@ async def test_bfs_subgraph_transient_error_raises_not_reports_false_complete(
 def _bfs_mget_side_effect(real_nodes: dict):
     """Mock ``client.mget`` for both the single-id start-node lookup and the
     batched per-level neighbor resolution. Ids absent from `real_nodes` come
-    back ``found: False``, mirroring a dangling edge endpoint (upsert_edge
-    only guarantees the source node exists, never the target)."""
+    back ``found: False``, mirroring a dangling edge endpoint. Writes now
+    materialize both endpoints, so new data cannot produce one, but documents
+    written before that change still can and the traversal must keep tolerating
+    them."""
 
     async def _mget(index=None, body=None, **kwargs):
         docs = []
@@ -645,12 +648,43 @@ def _bfs_mget_side_effect(real_nodes: dict):
 
 
 def _bfs_search_side_effect(edges: list):
-    """Mock ``client.search`` for both the per-level edge scan (``should``,
-    at least one endpoint in the frontier) and the final PIT-scrolled
-    edge fetch (``must``, both endpoints in the seen-node set)."""
+    """Mock ``client.search`` for the per-level edge scan (``should``, at least
+    one endpoint in the frontier), the degree aggregation that ranks a level
+    (``aggs``, same ``should`` query shape), and the final PIT-scrolled edge
+    fetch (``must``, both endpoints in the seen-node set)."""
 
     async def _search(index=None, body=None, **kwargs):
         bool_query = body["query"]["bool"]
+        if "aggs" in body:
+            ids = set(bool_query["should"][0]["terms"]["source_node_id"])
+            matching = [
+                e
+                for e in edges
+                if e["source_node_id"] in ids or e["target_node_id"] in ids
+            ]
+
+            def _buckets(name, field):
+                # The degree aggregations are `filter`-wrapped so their bucket
+                # keys cannot escape the requested ids; mirror both the filter
+                # and the nested "ids" level here.
+                allowed = set(body["aggs"][name]["filter"]["terms"][field])
+                counts = Counter(e[field] for e in matching if e[field] in allowed)
+                return {
+                    "ids": {
+                        "buckets": [
+                            {"key": key, "doc_count": count}
+                            for key, count in counts.items()
+                        ]
+                    }
+                }
+
+            return {
+                "hits": {"hits": []},
+                "aggregations": {
+                    "source_degrees": _buckets("source_degrees", "source_node_id"),
+                    "target_degrees": _buckets("target_degrees", "target_node_id"),
+                },
+            }
         if "should" in bool_query:
             ids = set(bool_query["should"][0]["terms"]["source_node_id"])
             hits = [
@@ -787,10 +821,12 @@ async def test_vector_query_missing_index_still_returns_empty(global_config):
 # ---------------------------------------------------------------------------
 
 
-async def test_upsert_edge_raises_when_has_node_check_fails(global_config):
+async def test_upsert_edge_raises_when_endpoint_existence_check_fails(global_config):
+    # upsert_edge materializes BOTH endpoints and probes them with one mget
+    # (has_nodes_batch), like upsert_edges_batch does.
     client = _make_graph_client()
     storage = await _make_graph(global_config, client)
-    client.exists = AsyncMock(side_effect=_transient_error())
+    client.mget = AsyncMock(side_effect=_transient_error())
     with pytest.raises(TransportError):
         await storage.upsert_edge("A", "B", {})
 

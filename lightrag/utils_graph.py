@@ -6,17 +6,225 @@ from typing import Any, cast
 
 from .base import DeletionResult
 from .kg.shared_storage import get_storage_keyed_lock
-from .constants import GRAPH_FIELD_SEP
+from .constants import GRAPH_FIELD_SEP, RELATION_NO_EVIDENCE_SOURCE_IDS
 from .operate import _truncate_vdb_content
 from .utils import (
     VectorStorageConsistencyError,
     compute_mdhash_id,
+    graph_attribute_value_rejection,
     logger,
     make_relation_vdb_ids,
     normalize_entity_name,
     safe_vdb_operation_with_exception,
 )
 from .base import StorageNameSpace
+
+# Field specs for the manual entity/relation mutation APIs. The value is the
+# expected shape: "text" for a string attribute, "number" for a numeric one.
+#
+# These are an allowlist, not documentation. `updated_data` used to be merged
+# into the stored object wholesale (`{**node_data, **updated_data}`), so any key
+# a caller invented was written with whatever value it carried -- including
+# values no graph backend can store. See `_sanitize_graph_fields`.
+_TEXT_FIELD = "text"
+_NUMBER_FIELD = "number"
+
+# `entity_name` is the rename target, which `aedit_entity` resolves and writes
+# back into `updated_data` before the merge; it is a legal edit field but not a
+# legal *create* field (create takes the name as its own argument).
+_EDITABLE_ENTITY_FIELDS: dict[str, str] = {
+    "entity_name": _TEXT_FIELD,
+    "entity_type": _TEXT_FIELD,
+    "description": _TEXT_FIELD,
+    "source_id": _TEXT_FIELD,
+    "file_path": _TEXT_FIELD,
+}
+_ENTITY_DATA_FIELDS: dict[str, str] = {
+    key: kind for key, kind in _EDITABLE_ENTITY_FIELDS.items() if key != "entity_name"
+}
+_RELATION_DATA_FIELDS: dict[str, str] = {
+    "description": _TEXT_FIELD,
+    "keywords": _TEXT_FIELD,
+    "source_id": _TEXT_FIELD,
+    "file_path": _TEXT_FIELD,
+    "weight": _NUMBER_FIELD,
+}
+
+
+def _sanitize_graph_fields(
+    data: dict[str, Any],
+    *,
+    allowed_fields: dict[str, str],
+    object_type: str,
+    reject_unknown: bool,
+) -> dict[str, Any]:
+    """Return *data* reduced to well-typed, storable graph attributes.
+
+    Two call shapes, because the two families of caller differ in what they do
+    with a key they do not recognise:
+
+    * ``reject_unknown=True`` (the edit/merge paths) -- these merge the caller's
+      mapping into the stored object, so an unrecognised key *is written*. It
+      has to be refused, and refused loudly: silently dropping it on an edit
+      endpoint would report success for a change that never happened.
+    * ``reject_unknown=False`` (the create paths) -- these already copy a fixed
+      set of named fields out of the mapping, so an unrecognised key is
+      structurally incapable of reaching storage. Only the values of the
+      recognised keys need checking, and refusing extra keys here would break
+      payloads that work today for no security gain.
+
+    Per-field types matter as much as the allowlist. A value can be a perfectly
+    storable scalar and still be wrong: ``{"source_id": 123}`` serializes fine
+    (GraphML long, JSON number), reaches disk, survives a restart, and then
+    breaks every later reader that splits ``source_id`` on ``GRAPH_FIELD_SEP``
+    -- a durable failure, unlike the transient one a non-scalar causes.
+
+    Args:
+        data: Caller-supplied attribute mapping.
+        allowed_fields: Field name to expected shape (``_TEXT_FIELD`` /
+            ``_NUMBER_FIELD``).
+        object_type: ``"entity"`` or ``"relation"``, for error messages.
+        reject_unknown: Whether an unrecognised key is an error (see above).
+
+    Returns:
+        A new mapping holding only recognised fields, with numeric fields
+        coerced to ``float``.
+
+    Raises:
+        ValueError: On an unknown field (when ``reject_unknown``), a field whose
+            value has the wrong shape, or a value no graph backend can store.
+    """
+    sanitized: dict[str, Any] = {}
+    for key, value in data.items():
+        kind = allowed_fields.get(key)
+        if kind is None:
+            if reject_unknown:
+                raise ValueError(
+                    f"Unknown {object_type} field '{key}'. Allowed fields: "
+                    f"{', '.join(sorted(allowed_fields))}"
+                )
+            continue
+
+        rejection = graph_attribute_value_rejection(value)
+        if rejection is not None:
+            raise ValueError(f"{object_type.capitalize()} field '{key}' {rejection}")
+
+        if kind == _NUMBER_FIELD:
+            # bool is an int subclass, and `float(True)` would quietly become
+            # 1.0 -- a boolean weight is a caller mistake, not a number.
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"{object_type.capitalize()} field '{key}' must be a number, "
+                    "got bool"
+                )
+            try:
+                # A numeric string is accepted because the create paths have
+                # always run the value through `float()`; normalizing here means
+                # the *stored* attribute is a float on the edit paths too,
+                # instead of a string that only the VDB payload converted.
+                coerced = float(value)
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError is what `float()` raises for an int too large to
+                # convert. The int64 bound in `graph_attribute_value_rejection`
+                # already refuses those above, so this is belt-and-braces for a
+                # future caller passing some other type whose `__float__`
+                # overflows -- without it the endpoint returns 500 for what is a
+                # validation failure.
+                raise ValueError(
+                    f"{object_type.capitalize()} field '{key}' must be a number, "
+                    f"got {value!r}"
+                ) from None
+            # Re-check the *coerced* value. The check above ran on what the
+            # caller sent, and for a numeric string that is a perfectly storable
+            # `str` -- it is this conversion that can produce the non-scalar the
+            # contract forbids ("nan" -> NaN, "1e999" -> inf). Skipping it would
+            # accept the request and then fail in storage: PGTableGraphStorage's
+            # jsonb column rejects the bare `NaN` json.dumps emits, so a 400
+            # would arrive as a 500, while permissive backends keep the value.
+            rejection = graph_attribute_value_rejection(coerced)
+            if rejection is not None:
+                raise ValueError(
+                    f"{object_type.capitalize()} field '{key}' {rejection}"
+                )
+            sanitized[key] = coerced
+        elif not isinstance(value, str):
+            raise ValueError(
+                f"{object_type.capitalize()} field '{key}' must be a string, got "
+                f"{type(value).__name__}"
+            )
+        else:
+            sanitized[key] = value
+
+    return sanitized
+
+
+def relation_evidence_source_ids(source_id: str) -> list[str]:
+    """Return ordered distinct source IDs that count as relation evidence.
+
+    Empty values and historical no-source placeholders are intentionally
+    excluded. New manual relations store an omitted source as an empty string;
+    the placeholders remain here only so legacy rows keep the same meaning.
+    """
+    if not isinstance(source_id, str):
+        raise ValueError(
+            "Relation field 'source_id' must be a string, got "
+            f"{type(source_id).__name__}"
+        )
+
+    return list(
+        dict.fromkeys(
+            source
+            for source in source_id.split(GRAPH_FIELD_SEP)
+            if source and source not in RELATION_NO_EVIDENCE_SOURCE_IDS
+        )
+    )
+
+
+def relation_evidence_count(source_id: str) -> int:
+    """Return the number of distinct real evidence sources on a relation."""
+    return len(relation_evidence_source_ids(source_id))
+
+
+def validate_relation_weight(
+    weight: Any,
+    source_id: str,
+    *,
+    context: str = "Relation",
+) -> float:
+    """Normalize a relation weight and enforce its evidence-count floor.
+
+    A relation weight is its evidence count plus an optional manual boost. A
+    caller may choose a fractional weight only when the relation has no real
+    source IDs; negative weights are therefore always invalid.
+    """
+    normalized = _sanitize_graph_fields(
+        {"weight": weight, "source_id": source_id},
+        allowed_fields=_RELATION_DATA_FIELDS,
+        object_type="relation",
+        reject_unknown=True,
+    )
+    normalized_weight = normalized["weight"]
+    evidence_count = relation_evidence_count(normalized["source_id"])
+    if normalized_weight < evidence_count:
+        raise ValueError(
+            f"{context} weight {normalized_weight} cannot be less than its "
+            f"distinct-source evidence count {evidence_count}"
+        )
+    return normalized_weight
+
+
+def apply_relation_weight_floor(weight: Any, source_id: str) -> float:
+    """Normalize a stored weight and repair it to the evidence-count floor."""
+    normalized = _sanitize_graph_fields(
+        {"weight": weight, "source_id": source_id},
+        allowed_fields=_RELATION_DATA_FIELDS,
+        object_type="relation",
+        reject_unknown=True,
+    )
+    return max(
+        normalized["weight"],
+        float(relation_evidence_count(normalized["source_id"])),
+    )
 
 
 def _require_non_empty_description(
@@ -25,6 +233,29 @@ def _require_non_empty_description(
     if description is None or not str(description).strip():
         raise ValueError(
             f"{object_type.capitalize()} description cannot be empty for {operation} operation"
+        )
+
+
+def _reject_self_loop_relation(
+    source_entity: Any, target_entity: Any, *, operation: str
+) -> None:
+    """Refuse a relation whose two endpoints are the same entity.
+
+    LightRAG's own extraction never emits a self-loop: ``operate.py`` drops
+    ``source == target`` in both record parsers and again in
+    ``_merge_edges_then_upsert``, and ``amerge_entities`` skips any endpoint
+    pair that would collapse into one. Manual creation is therefore the only
+    way such an edge can reach the graph, and a self-loop carries no
+    connectivity for graph retrieval — it only widens the surface where the
+    rest of the code has to reason about ``src == tgt``.
+
+    Rejected at the same layer as an empty description: before the keyed lock,
+    so a refusal writes nothing.
+    """
+    if source_entity == target_entity:
+        raise ValueError(
+            f"Cannot {operation} a self-loop relation on '{source_entity}': "
+            "source and target must be different entities"
         )
 
 
@@ -342,22 +573,34 @@ async def _edit_entity_impl(
             for source, target in edges:
                 edge_data = await chunk_entity_relation_graph.get_edge(source, target)
                 if edge_data:
+                    edge_data = dict(edge_data)
+                    edge_source_id = edge_data.get("source_id") or ""
+                    edge_data["source_id"] = edge_source_id
+                    edge_data["weight"] = apply_relation_weight_floor(
+                        edge_data.get("weight", 1.0), edge_source_id
+                    )
                     relations_to_delete.append(
                         compute_mdhash_id(source + target, prefix="rel-")
                     )
                     relations_to_delete.append(
                         compute_mdhash_id(target + source, prefix="rel-")
                     )
-                    if source == entity_name:
-                        await chunk_entity_relation_graph.upsert_edge(
-                            new_entity_name, target, edge_data
-                        )
-                        relations_to_update.append((new_entity_name, target, edge_data))
-                    else:  # target == entity_name
-                        await chunk_entity_relation_graph.upsert_edge(
-                            source, new_entity_name, edge_data
-                        )
-                        relations_to_update.append((source, new_entity_name, edge_data))
+                    # Rename every matching endpoint. A self-loop has the old
+                    # entity on both sides, so changing only the first match
+                    # would create (new, old), which is then removed together
+                    # with the old node below.
+                    renamed_source = (
+                        new_entity_name if source == entity_name else source
+                    )
+                    renamed_target = (
+                        new_entity_name if target == entity_name else target
+                    )
+                    await chunk_entity_relation_graph.upsert_edge(
+                        renamed_source, renamed_target, edge_data
+                    )
+                    relations_to_update.append(
+                        (renamed_source, renamed_target, edge_data)
+                    )
 
         await chunk_entity_relation_graph.delete_node(entity_name)
 
@@ -447,16 +690,18 @@ async def _edit_entity_impl(
         ) from e
 
     if entity_chunks_storage is not None or relation_chunks_storage is not None:
-        from .utils import make_relation_chunk_key, compute_incremental_chunk_ids
+        from .utils import (
+            make_relation_chunk_key,
+            compute_incremental_chunk_ids,
+            has_chunk_tracking_row,
+        )
 
         if entity_chunks_storage is not None:
             storage_key = original_entity_name if is_renaming else entity_name
             stored_data = await entity_chunks_storage.get_by_id(storage_key)
-            has_stored_data = (
-                stored_data
-                and isinstance(stored_data, dict)
-                and stored_data.get("chunk_ids")
-            )
+            # Row presence by schema, never list truthiness — see
+            # has_chunk_tracking_row for the authority model.
+            has_stored_row = has_chunk_tracking_row(stored_data)
 
             old_source_id = node_data.get("source_id", "")
             old_chunk_ids = [cid for cid in old_source_id.split(GRAPH_FIELD_SEP) if cid]
@@ -466,39 +711,39 @@ async def _edit_entity_impl(
 
             source_id_changed = set(new_chunk_ids) != set(old_chunk_ids)
 
-            if source_id_changed or not has_stored_data or is_renaming:
+            if source_id_changed or not has_stored_row or is_renaming:
                 existing_full_chunk_ids = []
-                if has_stored_data:
+                if has_stored_row:
                     existing_full_chunk_ids = [
                         cid for cid in stored_data.get("chunk_ids", []) if cid
                     ]
 
-                if not existing_full_chunk_ids:
+                # Reseed from the graph's source_id only when no tracking row exists at
+                # all; a present-but-empty row must not be repopulated from a possibly
+                # stale source_id.
+                if not has_stored_row:
                     existing_full_chunk_ids = old_chunk_ids.copy()
 
                 updated_chunk_ids = compute_incremental_chunk_ids(
                     existing_full_chunk_ids, old_chunk_ids, new_chunk_ids
                 )
 
+                # On rename, write the new key BEFORE deleting the old one: on
+                # RPC-backed KV storages each call commits independently, so the
+                # reverse order opens a crash window in which the row exists under
+                # neither key — turning a curated row absent and re-arming the
+                # stale reseed. An orphaned old-key row is dead bookkeeping; a
+                # lost row is the bug.
+                await entity_chunks_storage.upsert(
+                    {
+                        entity_name: {
+                            "chunk_ids": updated_chunk_ids,
+                            "count": len(updated_chunk_ids),
+                        }
+                    }
+                )
                 if is_renaming:
                     await entity_chunks_storage.delete([original_entity_name])
-                    await entity_chunks_storage.upsert(
-                        {
-                            entity_name: {
-                                "chunk_ids": updated_chunk_ids,
-                                "count": len(updated_chunk_ids),
-                            }
-                        }
-                    )
-                else:
-                    await entity_chunks_storage.upsert(
-                        {
-                            entity_name: {
-                                "chunk_ids": updated_chunk_ids,
-                                "count": len(updated_chunk_ids),
-                            }
-                        }
-                    )
 
                 logger.info(
                     f"Entity Edit: find {len(updated_chunk_ids)} chunks related to `{entity_name}`"
@@ -523,23 +768,37 @@ async def _edit_entity_impl(
                     old_stored_data = await relation_chunks_storage.get_by_id(
                         old_storage_key
                     )
+                    # Row presence by schema (see has_chunk_tracking_row): a
+                    # curated row — including an empty one — is authoritative and
+                    # must be migrated as-is; an absent or legacy/partial shape is
+                    # unknown and reseeded from the edge's source_id.
+                    old_row_present = has_chunk_tracking_row(old_stored_data)
                     relation_chunk_ids = []
 
-                    if old_stored_data and isinstance(old_stored_data, dict):
+                    if old_row_present:
                         relation_chunk_ids = [
-                            cid for cid in old_stored_data.get("chunk_ids", []) if cid
+                            cid
+                            for cid in old_stored_data.get("chunk_ids", [])
+                            if cid and cid not in RELATION_NO_EVIDENCE_SOURCE_IDS
                         ]
                     else:
                         relation_source_id = edge_data.get("source_id", "")
-                        relation_chunk_ids = [
-                            cid
-                            for cid in relation_source_id.split(GRAPH_FIELD_SEP)
-                            if cid
-                        ]
+                        relation_chunk_ids = relation_evidence_source_ids(
+                            relation_source_id
+                        )
 
-                    await relation_chunks_storage.delete([old_storage_key])
-
-                    if relation_chunk_ids:
+                    # Migrate the row to the new key. A present-but-empty row is
+                    # authoritative ("this relation tracks no chunks") and must
+                    # survive the rename; dropping it would make the row absent and
+                    # cause the next relation edit to reseed it from a possibly-stale
+                    # source_id — the exact bug this PR fixes, re-armed at rename.
+                    # Only skip the write when the row was absent AND source_id
+                    # yielded nothing to seed from. Upsert the new key BEFORE
+                    # deleting the old one: on RPC-backed KV storages each call
+                    # commits independently, and the reverse order opens a crash
+                    # window in which the row exists under neither key — losing the
+                    # curated row this migration exists to preserve.
+                    if old_row_present or relation_chunk_ids:
                         await relation_chunks_storage.upsert(
                             {
                                 new_storage_key: {
@@ -548,6 +807,8 @@ async def _edit_entity_impl(
                                 }
                             }
                         )
+
+                    await relation_chunks_storage.delete([old_storage_key])
             logger.info(
                 f"Entity Edit: migrate {len(relations_to_update)} relations after rename"
             )
@@ -590,7 +851,11 @@ async def aedit_entity(
         entities_vdb: Vector database storage for entities
         relationships_vdb: Vector database storage for relationships
         entity_name: Name of the entity to edit
-        updated_data: Dictionary containing updated attributes, e.g. {"description": "new description", "entity_type": "new type"}
+        updated_data: Attributes to update. Allowed fields: ``entity_name``
+            (rename target), ``entity_type``, ``description``,
+            ``source_id``, ``file_path`` -- all strings. Any other key,
+            or a value that is not a storable string, is rejected with
+            ``ValueError``.
         allow_rename: Whether to allow entity renaming, defaults to True
         allow_merge: Whether to merge into an existing entity when renaming to an existing name, defaults to False
         entity_chunks_storage: Optional KV storage for tracking chunks that reference this entity
@@ -625,14 +890,27 @@ async def aedit_entity(
             - "failed": Merge operation failed
             - "not_attempted": No merge was attempted (normal update/rename)
     """
+    # Order matters: the empty-description check runs first so a `None`
+    # description keeps reporting itself as empty (which is what it means to a
+    # caller) rather than as a type error. Both refuse before any storage is
+    # touched, so the ordering is about the message, not about safety.
     if "description" in updated_data:
         _require_non_empty_description(
             updated_data.get("description"), operation="edit", object_type="entity"
         )
 
+    # Reduce to allowed, well-typed fields before anything else: this runs
+    # outside the storage lock and before the first graph read, so a rejected
+    # payload has touched nothing at all.
+    updated_data = _sanitize_graph_fields(
+        updated_data,
+        allowed_fields=_EDITABLE_ENTITY_FIELDS,
+        object_type="entity",
+        reject_unknown=True,
+    )
+
     requested_entity_name = entity_name
     normalized_entity_name = _normalize_manual_entity_name(requested_entity_name)
-    updated_data = dict(updated_data)
 
     has_new_entity_name = "entity_name" in updated_data
     requested_new_entity_name = updated_data.get("entity_name")
@@ -856,16 +1134,31 @@ async def aedit_relation(
         relationships_vdb: Vector database storage for relationships
         source_entity: Name of the source entity
         target_entity: Name of the target entity
-        updated_data: Dictionary containing updated attributes, e.g. {"description": "new description", "keywords": "new keywords"}
+        updated_data: Attributes to update. Allowed fields:
+            ``description``, ``keywords``, ``source_id``, ``file_path``
+            (strings) and ``weight`` (number). Any other key, or a value
+            of the wrong shape, is rejected with ``ValueError``. The complete
+            updated relation must satisfy ``weight >=`` its number of distinct
+            real ``source_id`` values. Set ``source_id`` to an empty string in
+            the same edit when assigning a fractional weight below the
+            previous evidence count.
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
 
     Returns:
         Dictionary containing updated relation information
     """
+    # See `aedit_entity` for the ordering rationale.
     if "description" in updated_data:
         _require_non_empty_description(
             updated_data.get("description"), operation="edit", object_type="relation"
         )
+
+    updated_data = _sanitize_graph_fields(
+        updated_data,
+        allowed_fields=_RELATION_DATA_FIELDS,
+        object_type="relation",
+        reject_unknown=True,
+    )
 
     # Normalize entity order for undirected graph (ensures consistent key generation)
     if source_entity > target_entity:
@@ -901,8 +1194,21 @@ async def aedit_relation(
             new_edge_data = {**edge_data, **updated_data}
             description = new_edge_data.get("description", "")
             keywords = new_edge_data.get("keywords", "")
-            source_id = new_edge_data.get("source_id", "")
-            weight = float(new_edge_data.get("weight", 1.0))
+            source_id = new_edge_data.get("source_id") or ""
+            if "weight" in updated_data or "source_id" in updated_data:
+                weight = validate_relation_weight(
+                    new_edge_data.get("weight", 1.0),
+                    source_id,
+                    context=f"Relation `{source_entity}`~`{target_entity}`",
+                )
+            else:
+                # An unrelated edit is also a safe repair point for a legacy
+                # row that predates the evidence-floor contract.
+                weight = apply_relation_weight_floor(
+                    new_edge_data.get("weight", 1.0), source_id
+                )
+            new_edge_data["source_id"] = source_id
+            new_edge_data["weight"] = weight
 
             content = _truncate_vdb_content(
                 f"{source_entity}\t{target_entity}\n{keywords}\n{description}",
@@ -945,49 +1251,64 @@ async def aedit_relation(
             # Update vector database
             await relationships_vdb.upsert(relation_data)
 
-            # 4. Update relation_chunks_storage in two scenarios:
-            #    - source_id has changed (edit scenario)
-            #    - relation_chunks_storage has no existing data (migration/initialization scenario)
+            # 4. Synchronize relation chunk tracking after source edits, when
+            #    tracking is missing, or when a legacy row still contains a
+            #    historical no-evidence placeholder.
             if relation_chunks_storage is not None:
                 from .utils import (
                     make_relation_chunk_key,
                     compute_incremental_chunk_ids,
+                    has_chunk_tracking_row,
                 )
 
                 storage_key = make_relation_chunk_key(source_entity, target_entity)
 
                 # Check if storage has existing data
                 stored_data = await relation_chunks_storage.get_by_id(storage_key)
-                has_stored_data = (
-                    stored_data
-                    and isinstance(stored_data, dict)
-                    and stored_data.get("chunk_ids")
+                # Row presence by schema, never list truthiness — see
+                # has_chunk_tracking_row for the authority model.
+                has_stored_row = has_chunk_tracking_row(stored_data)
+                stored_chunk_ids = (
+                    [cid for cid in stored_data["chunk_ids"] if cid]
+                    if has_stored_row
+                    else []
+                )
+                tracking_has_legacy_placeholder = any(
+                    cid in RELATION_NO_EVIDENCE_SOURCE_IDS for cid in stored_chunk_ids
                 )
 
                 # Get old and new source_id
                 old_source_id = edge_data.get("source_id", "")
-                old_chunk_ids = [
-                    cid for cid in old_source_id.split(GRAPH_FIELD_SEP) if cid
-                ]
+                old_chunk_ids = relation_evidence_source_ids(old_source_id)
 
                 new_source_id = new_edge_data.get("source_id", "")
-                new_chunk_ids = [
-                    cid for cid in new_source_id.split(GRAPH_FIELD_SEP) if cid
-                ]
+                new_chunk_ids = relation_evidence_source_ids(new_source_id)
 
                 source_id_changed = set(new_chunk_ids) != set(old_chunk_ids)
+                raw_source_id_changed = new_source_id != old_source_id
 
-                # Update if: source_id changed OR storage has no data
-                if source_id_changed or not has_stored_data:
+                # Update if: the evidence set or the raw source_id changed, no
+                # tracking row exists, or a legacy row still carries a
+                # no-evidence placeholder this edit can repair.
+                if (
+                    source_id_changed
+                    or raw_source_id_changed
+                    or tracking_has_legacy_placeholder
+                    or not has_stored_row
+                ):
                     # Get existing full chunk_ids from storage
                     existing_full_chunk_ids = []
-                    if has_stored_data:
+                    if has_stored_row:
                         existing_full_chunk_ids = [
-                            cid for cid in stored_data.get("chunk_ids", []) if cid
+                            cid
+                            for cid in stored_chunk_ids
+                            if cid and cid not in RELATION_NO_EVIDENCE_SOURCE_IDS
                         ]
 
-                    # If no stored data exists, use old source_id as baseline
-                    if not existing_full_chunk_ids:
+                    # Reseed from the graph's source_id only when no tracking row exists
+                    # at all; a present-but-empty row must not be repopulated from a
+                    # possibly stale source_id.
+                    if not has_stored_row:
                         existing_full_chunk_ids = old_chunk_ids.copy()
 
                     # Use utility function to compute incremental updates
@@ -1061,6 +1382,17 @@ async def acreate_entity(
     """
     _require_non_empty_description(
         entity_data.get("description"), operation="create", object_type="entity"
+    )
+
+    # The named-field copy below stops an unknown *key* from reaching storage,
+    # but not an unstorable *value* on a known one: a non-scalar `entity_type`
+    # reaches `upsert_node` unexamined. Type-check the recognised fields (extra
+    # keys stay ignored, as they always were -- see `_sanitize_graph_fields`).
+    entity_data = _sanitize_graph_fields(
+        entity_data,
+        allowed_fields=_ENTITY_DATA_FIELDS,
+        object_type="entity",
+        reject_unknown=False,
     )
 
     requested_entity_name = entity_name
@@ -1196,7 +1528,10 @@ async def acreate_relation(
         relationships_vdb: Vector database storage for relationships
         source_entity: Name of the source entity
         target_entity: Name of the target entity
-        relation_data: Dictionary containing relation attributes, e.g. {"description": "description", "keywords": "keywords"}
+        relation_data: Dictionary containing relation attributes. ``weight``
+            defaults to 1.0 and must be at least the number of distinct real
+            values in ``source_id``. An omitted ``source_id`` is stored as an
+            empty string and permits a non-negative fractional weight.
         relation_chunks_storage: Optional KV storage for tracking chunks that reference this relation
 
     Returns:
@@ -1204,6 +1539,18 @@ async def acreate_relation(
     """
     _require_non_empty_description(
         relation_data.get("description"), operation="create", object_type="relation"
+    )
+    # The graph edge below is written with these exact strings, so comparing
+    # them raw is precisely the condition that would produce a self-loop.
+    _reject_self_loop_relation(source_entity, target_entity, operation="create")
+
+    # Same reasoning as `acreate_entity`: values of the recognised fields are
+    # type-checked, unrecognised keys stay ignored.
+    relation_data = _sanitize_graph_fields(
+        relation_data,
+        allowed_fields=_RELATION_DATA_FIELDS,
+        object_type="relation",
+        reject_unknown=False,
     )
 
     # Use keyed lock for relation to ensure atomic graph and vector db operations
@@ -1232,12 +1579,20 @@ async def acreate_relation(
                     f"Relation from '{source_entity}' to '{target_entity}' already exists"
                 )
 
-            # Prepare edge data with defaults if missing
+            source_id = relation_data.get("source_id", "")
+            weight = validate_relation_weight(
+                relation_data.get("weight", 1.0),
+                source_id,
+                context=f"Relation `{source_entity}`~`{target_entity}`",
+            )
+
+            # Prepare edge data with defaults if missing. An omitted source is
+            # genuinely source-less; do not synthesize an evidence ID.
             edge_data = {
                 "description": relation_data.get("description", ""),
                 "keywords": relation_data.get("keywords", ""),
-                "source_id": relation_data.get("source_id", "manual_creation"),
-                "weight": float(relation_data.get("weight", 1.0)),
+                "source_id": source_id,
+                "weight": weight,
                 "file_path": relation_data.get("file_path", "manual_creation"),
                 "created_at": int(time.time()),
             }
@@ -1255,8 +1610,8 @@ async def acreate_relation(
             # Prepare content for embedding
             description = edge_data.get("description", "")
             keywords = edge_data.get("keywords", "")
-            source_id = edge_data.get("source_id", "")
-            weight = edge_data.get("weight", 1.0)
+            source_id = edge_data["source_id"]
+            weight = edge_data["weight"]
 
             # Construct and verify the VDB payload BEFORE the first graph
             # mutation below: if truncation fails (a deterministic,
@@ -1301,7 +1656,7 @@ async def acreate_relation(
                 storage_key = make_relation_chunk_key(vdb_src, vdb_tgt)
 
                 source_id = edge_data.get("source_id", "")
-                chunk_ids = [cid for cid in source_id.split(GRAPH_FIELD_SEP) if cid]
+                chunk_ids = relation_evidence_source_ids(source_id)
 
                 if chunk_ids:
                     await relation_chunks_storage.upsert(
@@ -1374,6 +1729,8 @@ async def _merge_entities_impl(
     Note:
         Caller must acquire appropriate locks before calling this function.
         All source entities and the target entity should be locked together.
+        When redirected relations collapse onto the same endpoint, their
+        weight is ``max(input weights, distinct merged evidence sources)``.
 
     Failure semantics:
         The knowledge graph is the authoritative data source. If a vector
@@ -1471,7 +1828,7 @@ async def _merge_entities_impl(
 
         # Collect old chunk tracking key for deletion
         if relation_chunks_storage is not None:
-            from .utils import make_relation_chunk_key
+            from .utils import make_relation_chunk_key, has_chunk_tracking_row
 
             old_storage_key = make_relation_chunk_key(src, tgt)
             old_relation_keys_to_delete.append(old_storage_key)
@@ -1495,12 +1852,20 @@ async def _merge_entities_impl(
             # Get chunk_ids from storage for this original relation
             stored = await relation_chunks_storage.get_by_id(old_storage_key)
 
-            if stored is not None and isinstance(stored, dict):
-                chunk_ids = [cid for cid in stored.get("chunk_ids", []) if cid]
+            # Row presence by schema, consistent with the edit/rename paths —
+            # see has_chunk_tracking_row for the authority model. Legacy
+            # no-evidence placeholders are dropped so the merged row keeps only
+            # real chunk attribution.
+            if has_chunk_tracking_row(stored):
+                chunk_ids = [
+                    cid
+                    for cid in stored["chunk_ids"]
+                    if cid and cid not in RELATION_NO_EVIDENCE_SOURCE_IDS
+                ]
             else:
                 # Fallback to source_id from graph
                 source_id = edge_data.get("source_id", "")
-                chunk_ids = [cid for cid in source_id.split(GRAPH_FIELD_SEP) if cid]
+                chunk_ids = relation_evidence_source_ids(source_id)
 
             # Accumulate chunk_ids with ordered deduplication
             if storage_key not in relation_chunk_tracking:
@@ -1515,7 +1880,7 @@ async def _merge_entities_impl(
         if relation_key in relation_updates:
             # Merge relationship data
             existing_data = relation_updates[relation_key]["data"]
-            merged_relation = _merge_attributes(
+            updated_relation = _merge_attributes(
                 [existing_data, edge_data],
                 {
                     "description": "concatenate",
@@ -1526,18 +1891,29 @@ async def _merge_entities_impl(
                 },
                 filter_none_only=True,  # Use relation behavior: only filter None
             )
-            relation_updates[relation_key]["data"] = merged_relation
             logger.debug(
                 f"Entity Merge: deduplicating relation `{normalized_src}`~`{normalized_tgt}`"
             )
         else:
+            updated_relation = edge_data.copy()
             relation_updates[relation_key] = {
                 "graph_src": new_src,
                 "graph_tgt": new_tgt,
                 "norm_src": normalized_src,
                 "norm_tgt": normalized_tgt,
-                "data": edge_data.copy(),
+                "data": updated_relation,
             }
+
+        # Every distinct real source contributes a baseline evidence count of
+        # 1. Apply the floor to the first redirected relation as well as later
+        # duplicates so every relation rewritten by the merge repairs legacy
+        # undersized weights. The "max" merge strategy still preserves the
+        # strongest input boost and FIFO-accumulated weights.
+        updated_relation["weight"] = apply_relation_weight_floor(
+            updated_relation.get("weight", 1.0),
+            updated_relation.get("source_id") or "",
+        )
+        relation_updates[relation_key]["data"] = updated_relation
 
     # Apply relationship updates
     logger.info(f"Entity Merge: updating {len(relation_updates)} relations")
@@ -1549,11 +1925,15 @@ async def _merge_entities_impl(
             f"Entity Merge: updating relation `{rel_data['graph_src']}`~`{rel_data['graph_tgt']}`"
         )
 
-    # Update relation chunk tracking storage
+    # Update relation chunk tracking storage. Upsert the migrated rows BEFORE
+    # deleting the old keys: on RPC-backed KV storages each call commits
+    # independently, so the reverse order opened a crash window in which every
+    # migrated relation row was lost — turning curated rows absent and
+    # re-arming the stale source_id reseed (#3609). A key can be both old and
+    # new (relations already attached to an existing target keep their key),
+    # so only keys outside the new key set are deleted; deleting them after
+    # the upsert would drop the rows just written.
     if relation_chunks_storage is not None and all_relations:
-        if old_relation_keys_to_delete:
-            await relation_chunks_storage.delete(old_relation_keys_to_delete)
-
         if relation_chunk_tracking:
             updates = {}
             for storage_key, chunk_ids in relation_chunk_tracking.items():
@@ -1566,6 +1946,14 @@ async def _merge_entities_impl(
             logger.info(
                 f"Entity Merge: {len(updates)} relation chunk tracking records updated"
             )
+
+        stale_relation_keys = [
+            key
+            for key in dict.fromkeys(old_relation_keys_to_delete)
+            if key not in relation_chunk_tracking
+        ]
+        if stale_relation_keys:
+            await relation_chunks_storage.delete(stale_relation_keys)
 
     # 7. Update relationship vector representations
     logger.debug(
@@ -1729,7 +2117,10 @@ async def _merge_entities_impl(
 
     # 9. Merge entity chunk tracking (source entities first, then target entity)
     if entity_chunks_storage is not None:
+        from .utils import has_chunk_tracking_row
+
         all_chunk_id_lists = []
+        any_row_present = False
 
         # Build list of entities to process (source entities first, then target entity)
         entities_to_process = []
@@ -1743,13 +2134,38 @@ async def _merge_entities_impl(
         if target_exists:
             entities_to_process.append(target_entity)
 
-        # Process all entities in order with unified logic
+        # Pre-merge node data captured in steps 1-2, BEFORE step 5 overwrote
+        # the target node with the merged payload (whose source_id unions
+        # every input's contribution and must not be attributed to any single
+        # input entity).
+        pre_merge_node_data = dict(source_entities_data)
+        if target_exists:
+            pre_merge_node_data[target_entity] = existing_target_entity_data
+
+        # Process all entities in order with unified logic. Row presence by
+        # schema, never list truthiness (see has_chunk_tracking_row) — and
+        # decided PER INPUT ENTITY: one entity's curated-empty row asserts
+        # only that THAT entity tracks no chunks, never that another input's
+        # unknown (absent/malformed) row is empty too. An input without a
+        # usable row falls back to its own pre-merge graph source_id, exactly
+        # as a single-entity edit would; folding such an input into an
+        # authoritative empty target row would silently discard its
+        # attribution with no later recovery path (the empty row is
+        # authoritative from then on).
         for entity_name in entities_to_process:
             stored = await entity_chunks_storage.get_by_id(entity_name)
-            if stored and isinstance(stored, dict):
+            if has_chunk_tracking_row(stored):
+                any_row_present = True
                 chunk_ids = [cid for cid in stored.get("chunk_ids", []) if cid]
-                if chunk_ids:
-                    all_chunk_id_lists.append(chunk_ids)
+            else:
+                node_source_id = (pre_merge_node_data.get(entity_name) or {}).get(
+                    "source_id"
+                ) or ""
+                chunk_ids = [
+                    cid for cid in node_source_id.split(GRAPH_FIELD_SEP) if cid
+                ]
+            if chunk_ids:
+                all_chunk_id_lists.append(chunk_ids)
 
         # Merge chunk_ids with ordered deduplication (preserves order, source entities first)
         merged_chunk_ids = []
@@ -1760,13 +2176,17 @@ async def _merge_entities_impl(
                     seen.add(chunk_id)
                     merged_chunk_ids.append(chunk_id)
 
-        # Delete source entities' chunk tracking records
-        entity_keys_to_delete = [e for e in source_entities if e != target_entity]
-        if entity_keys_to_delete:
-            await entity_chunks_storage.delete(entity_keys_to_delete)
-
-        # Update target entity's chunk tracking
-        if merged_chunk_ids:
+        # Update target entity's chunk tracking BEFORE deleting the source
+        # rows: on RPC-backed KV storages each call commits independently, so
+        # the reverse order opens a crash window in which the merged
+        # attribution exists under no key at all. Write only when at least
+        # one input had a usable row: a present row is what licenses an
+        # authoritative target row (the source_id fallbacks above only fill
+        # in the other inputs' contributions within that write). With no row
+        # present the merged attribution is entirely unknown, and the target
+        # row stays absent — fabricating one would promote UNKNOWN to
+        # authoritative.
+        if any_row_present:
             await entity_chunks_storage.upsert(
                 {
                     target_entity: {
@@ -1778,6 +2198,11 @@ async def _merge_entities_impl(
             logger.info(
                 f"Entity Merge: find {len(merged_chunk_ids)} chunks related to '{target_entity}'"
             )
+
+        # Delete source entities' chunk tracking records
+        entity_keys_to_delete = [e for e in source_entities if e != target_entity]
+        if entity_keys_to_delete:
+            await entity_chunks_storage.delete(entity_keys_to_delete)
 
     # 10. Delete source entities
     for entity_name in source_entities:
@@ -1880,6 +2305,18 @@ async def amerge_entities(
     """
     if not source_entities:
         raise ValueError("At least one source entity is required for merge")
+
+    # `_merge_entities_impl` copies these keys onto the merged node verbatim
+    # (`merged_entity_data[key] = value`), which is the same wholesale merge the
+    # edit paths do. Not reachable from the HTTP route today -- the merge
+    # endpoint does not pass it -- but it is part of the public Python API.
+    if target_entity_data:
+        target_entity_data = _sanitize_graph_fields(
+            target_entity_data,
+            allowed_fields=_ENTITY_DATA_FIELDS,
+            object_type="entity",
+            reject_unknown=True,
+        )
 
     requested_source_entities = list(source_entities)
     normalized_source_entities = [

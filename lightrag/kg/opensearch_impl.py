@@ -326,6 +326,16 @@ _EDGE_ID_CANONICAL_META_FLAG = "edge_id_canonical_v1"
 # watching a large-index reindex see liveness and an X/total denominator.
 _EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
 
+# Ceiling on how many same-depth candidates get a degree lookup before the
+# max_nodes cap. node_degrees_batch puts the whole list in four `terms` clauses
+# (two in the query, two in the aggregation filters) and asks for one bucket per
+# id in each of its two aggregations, so an unbounded level (one hub with 100k
+# neighbours reaches that at depth 1) breaches OpenSearch's default
+# index.max_terms_count / search.max_buckets of 65536 and turns a truncated
+# subgraph into a failed request. 8192 keeps both well inside the defaults while
+# still ranking far more candidates than max_nodes admits.
+_GRAPH_DEGREE_RANK_MAX_CANDIDATES = 8192
+
 
 def _canonical_edge_id(source_node_id: str, target_node_id: str) -> str:
     """Direction-independent edge document ``_id``.
@@ -1471,10 +1481,12 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         construction shared by :meth:`get_docs_by_statuses` (via
         :meth:`_search_all_docs`) and the :meth:`get_full_docs_by_ids`
         hydration path. Raises ``KeyError``/``TypeError`` on a malformed
-        source; the caller decides strict (raise) vs relaxed (skip).
+        source (missing required fields); the caller decides strict (raise)
+        vs relaxed (skip). Fields the dataclass does not declare are
+        tolerated — see ``DocProcessingStatus.from_stored``.
         """
         data = self._prepare_doc_status_data(source)
-        return DocProcessingStatus(**data)
+        return DocProcessingStatus.from_stored(data)
 
     async def initialize(self):
         """Initialize client connection and create the doc-status index."""
@@ -2095,7 +2107,9 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             for hit in response["hits"]["hits"]:
                 try:
                     data = self._prepare_doc_status_data(hit["_source"])
-                    documents.append((hit["_id"], DocProcessingStatus(**data)))
+                    documents.append(
+                        (hit["_id"], DocProcessingStatus.from_stored(data))
+                    )
                 except (KeyError, TypeError) as e:
                     logger.error(
                         f"[{self.workspace}] Error parsing doc {hit['_id']}: {e}"
@@ -3804,10 +3818,31 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             raise
 
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
-        """Get all (source, target) edge tuples connected to a node."""
+        """Get all (source, target) edge tuples connected to a node.
+
+        Returns None if the node does not exist; an existing node with no
+        relations returns ``[]``. Answering ``[]`` for both would make a deleted
+        entity indistinguishable from an isolated one — the BaseGraphStorage
+        contract keeps them apart, even though no in-tree caller reads the
+        distinction today. A transport error is neither value: it propagates,
+        so "no neighbours" stays a positively confirmed fact (see
+        test_opensearch_strict_reads).
+        """
         if not self._indices_ready:
             return None
         try:
+            # Existence is decided by the node index, before the edge scan —
+            # never inferred from the edges. upsert_edge / upsert_edges_batch now
+            # materialize both endpoints, so a dangling target should not arise
+            # from new writes, but documents written before that change still can
+            # carry one, and a read contract must not rest on a write-path
+            # invariant anyway. Inferring existence from the edge scan would make
+            # this method contradict has_node() on the same id, and delete_entity
+            # 404s on has_node(). exists() is a real-time id lookup (no refresh
+            # needed), and checking first skips the PIT scan for an absent node.
+            if not await self.has_node(source_node_id):
+                return None
+
             await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             query = {
                 "bool": {
@@ -3908,33 +3943,55 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         ]
                     }
                 },
+                # Each aggregation is wrapped in a `filter` so its bucket keys
+                # are structurally confined to the requested ids. Without it the
+                # `should` query admits any edge whose OTHER endpoint matched, so
+                # `source_node_id` can take as many distinct values as the level
+                # has neighbours -- far past any bucket budget derived from
+                # len(node_ids). `terms` returns the top `size` buckets by
+                # doc_count, so the overflow silently drops the LOW-degree
+                # requested nodes, which then rank as degree 0 and fall back to
+                # label order. Confined keys make `size: len(node_ids)` exact.
                 "aggs": {
                     "source_degrees": {
-                        "terms": {
-                            "field": "source_node_id",
-                            "size": len(node_ids) * 2,
-                        }
+                        "filter": {"terms": {"source_node_id": node_ids}},
+                        "aggs": {
+                            "ids": {
+                                "terms": {
+                                    "field": "source_node_id",
+                                    "size": len(node_ids),
+                                }
+                            }
+                        },
                     },
                     "target_degrees": {
-                        "terms": {
-                            "field": "target_node_id",
-                            "size": len(node_ids) * 2,
-                        }
+                        "filter": {"terms": {"target_node_id": node_ids}},
+                        "aggs": {
+                            "ids": {
+                                "terms": {
+                                    "field": "target_node_id",
+                                    "size": len(node_ids),
+                                }
+                            }
+                        },
                     },
                 },
             }
             response = await self.client.search(index=self._edges_index, body=body)
+            # Membership against a set: callers now pass whole BFS levels here
+            # (thousands of ids), and a list scan per bucket makes this loop
+            # quadratic and blocks the event loop for seconds.
+            requested = set(node_ids)
             result = {}
-            for bucket in response["aggregations"]["source_degrees"]["buckets"]:
-                if bucket["key"] in node_ids:
-                    result[bucket["key"]] = (
-                        result.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
-            for bucket in response["aggregations"]["target_degrees"]["buckets"]:
-                if bucket["key"] in node_ids:
-                    result[bucket["key"]] = (
-                        result.get(bucket["key"], 0) + bucket["doc_count"]
-                    )
+            for agg_name in ("source_degrees", "target_degrees"):
+                buckets = response["aggregations"][agg_name]["ids"]["buckets"]
+                for bucket in buckets:
+                    # The filter above already confines the keys; this stays as
+                    # cheap defense against a stray key reaching the sum.
+                    if bucket["key"] in requested:
+                        result[bucket["key"]] = (
+                            result.get(bucket["key"], 0) + bucket["doc_count"]
+                        )
             return result
         except OpenSearchException as e:
             if _is_missing_index_error(e):
@@ -4026,6 +4083,33 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error upserting node {node_id}: {e}")
             raise
 
+    async def _create_placeholder_node(self, node_id: str) -> None:
+        """Insert an empty node document for an edge endpoint. Never overwrite.
+
+        ``op_type=create`` is insert-only: a 409 means the endpoint already
+        exists and we keep whatever it holds. ``upsert_node()`` cannot be used
+        for this — it goes through the plain index API, which REPLACES the
+        document, so an endpoint carrying a real description / entity_type /
+        source_ids would be silently reduced to a bare placeholder.
+
+        That matters twice over. The existence probe can only ever be a
+        best-effort hint: a concurrent writer may create the endpoint between
+        the probe and this call. Insert-only makes the placeholder write safe
+        regardless of what the probe concluded, instead of trusting it.
+        """
+        try:
+            await self.client.index(
+                index=self._nodes_index,
+                id=node_id,
+                body={"entity_id": node_id},
+                op_type="create",
+            )
+            self._nodes_dirty = True
+        except ConflictError:
+            # 409: the endpoint already exists. Nothing to do -- and nothing
+            # lost, which is the whole point of create over index.
+            pass
+
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
     ) -> None:
@@ -4043,9 +4127,20 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         """
         try:
             await self._ensure_indices_ready()
-            # Ensure source node exists (don't overwrite if it already has data)
-            if not await self.has_node(source_node_id):
-                await self.upsert_node(source_node_id, {})
+            # Materialize BOTH endpoints, not just the source. A target-only
+            # endpoint would otherwise carry edges with no node document, and
+            # that dangling state is externally visible: has_node() says absent
+            # while the edge scan says connected, get_popular_labels ranks an id
+            # get_node returns nothing for, and delete_entity 404s on an entity
+            # whose edges are right there. NetworkXStorage.add_edge and
+            # PGOpsGraphStorage both create both ends; this makes the document
+            # backends agree. One mget for the pair, and existing nodes are left
+            # untouched so real properties are never overwritten by a placeholder.
+            endpoints = list(dict.fromkeys((source_node_id, target_node_id)))
+            existing_endpoints = await self.has_nodes_batch(endpoints)
+            for node_id in endpoints:
+                if node_id not in existing_endpoints:
+                    await self._create_placeholder_node(node_id)
 
             doc = {k: v for k, v in edge_data.items() if k != "_id"}
             doc["source_node_id"] = source_node_id
@@ -4112,7 +4207,16 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             node_ids: List of node IDs to check.
 
         Returns:
-            Set of node_ids that exist in the graph.
+            Set of node_ids CONFIRMED to exist in the graph.
+
+        An id is reported absent only when its mget item says ``found: false``.
+        OpenSearch answers an mget with HTTP 200 even when individual items
+        failed (an unavailable shard yields an ``error`` object and no ``found``
+        flag), and a short or malformed ``docs`` array is not evidence either:
+        those raise, via the same ``_interpret_mget_item`` contract every other
+        mget read in this file uses. Treating them as "absent" is what turns a
+        transient blip into a fact — the edge-endpoint writers act on this set
+        by creating placeholder nodes, and entity merge/dedup act on it too.
         """
         if not node_ids:
             return set()
@@ -4122,7 +4226,18 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             response = await self.client.mget(
                 index=self._nodes_index, body={"ids": node_ids}
             )
-            return {doc["_id"] for doc in response.get("docs", []) if doc.get("found")}
+            docs = response.get("docs")
+            if not isinstance(docs, list) or len(docs) != len(node_ids):
+                raise RuntimeError(
+                    f"OpenSearch mget for {len(node_ids)} node ids returned "
+                    f"{len(docs) if isinstance(docs, list) else 'no'} items, "
+                    f"expected exactly {len(node_ids)}"
+                )
+            return {
+                node_id
+                for node_id, item in zip(node_ids, docs)
+                if _interpret_mget_item(item, node_id, require_source=False) is not None
+            }
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
@@ -4148,14 +4263,55 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             await self._ensure_indices_ready()
 
-            # Ensure all source nodes exist (mirrors upsert_edge behaviour)
-            source_ids = list({src for src, _tgt, _data in edges})
-            existing_sources = await self.has_nodes_batch(source_ids)
-            missing_sources = [
-                (nid, {}) for nid in source_ids if nid not in existing_sources
+            # Both endpoints, not just the source — see upsert_edge for why a
+            # target-only endpoint is externally visible as an inconsistency.
+            endpoint_ids = list(
+                dict.fromkeys(
+                    node_id for src, tgt, _data in edges for node_id in (src, tgt)
+                )
+            )
+            existing_endpoints = await self.has_nodes_batch(endpoint_ids)
+            # Insert-only, exactly like _create_placeholder_node on the
+            # single-edge path: upsert_nodes_batch would bulk-INDEX these, and a
+            # replace would strip a real node back to a bare placeholder if the
+            # probe raced a concurrent writer. A 409 here just means the
+            # endpoint already exists, so it is filtered out below rather than
+            # failing the batch.
+            placeholder_actions = [
+                {
+                    "_op_type": "create",
+                    "_index": self._nodes_index,
+                    "_id": nid,
+                    "_source": {"entity_id": nid},
+                }
+                for nid in endpoint_ids
+                if nid not in existing_endpoints
             ]
-            if missing_sources:
-                await self.upsert_nodes_batch(missing_sources)
+            if placeholder_actions:
+                _success, errors = await _run_chunked_async_bulk(
+                    self.client,
+                    placeholder_actions,
+                    max_payload_bytes=self._max_upsert_payload_bytes,
+                    max_records_per_batch=self._max_upsert_records_per_batch,
+                    log_prefix=f"[{self.workspace}] {self.namespace} edges:",
+                    what="edge endpoint placeholder create",
+                    raise_on_error=False,
+                )
+                real_errors = [
+                    e
+                    for e in errors
+                    if not (
+                        isinstance(e, dict)
+                        and isinstance(e.get("create"), dict)
+                        and e["create"].get("status") == 409
+                    )
+                ]
+                if real_errors:
+                    raise RuntimeError(
+                        f"[{self.workspace}] Failed to create edge endpoint "
+                        f"placeholders: {real_errors[:3]}"
+                    )
+                self._nodes_dirty = True
 
             # Key every edge by its canonical id and dedupe within the batch
             # (last-write-wins) so a single bulk request carries one action per
@@ -4374,9 +4530,26 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             raise
 
     async def _collect_node_ids(
-        self, limit: int, exclude_ids: set[str] | None = None
+        self,
+        limit: int,
+        exclude_ids: set[str] | None = None,
+        ordered: bool = False,
     ) -> list[str]:
-        """Collect up to `limit` node IDs, optionally skipping known IDs."""
+        """Collect up to `limit` node IDs, optionally skipping known IDs.
+
+        `ordered` scans in ``entity_id`` ascending order. Pass it whenever the
+        scan STOPS EARLY on a set whose members tie, because then the visit
+        order IS the tie-break: neither default path provides one. The
+        unexcluded fast path sends no sort at all, and the PIT path's
+        ``_pit_sort_with_field`` is a pagination tiebreaker that collapses to
+        ``_shard_doc`` on OpenSearch >= 3.3 — shard order. See
+        :meth:`_collect_isolated_labels`, which spells the sort out for exactly
+        this reason. ``entity_id`` mirrors ``_id`` and so is a total order,
+        which is also what makes it usable as the ``search_after`` key.
+
+        Leave it off when the caller takes every node it can reach, where the
+        order cannot change which nodes come back.
+        """
         if limit <= 0:
             return []
 
@@ -4387,6 +4560,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 "_source": False,
                 "size": limit,
             }
+            if ordered:
+                body["sort"] = [{"entity_id": {"order": "asc"}}]
             resp = await self.client.search(index=self._nodes_index, body=body)
             return [hit["_id"] for hit in resp["hits"]["hits"]]
 
@@ -4403,7 +4578,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "_source": False,
                     "size": 10000,
                     "pit": {"id": pit_id, "keep_alive": "1m"},
-                    "sort": _pit_sort_with_field("entity_id"),
+                    "sort": (
+                        [{"entity_id": {"order": "asc"}}]
+                        if ordered
+                        else _pit_sort_with_field("entity_id")
+                    ),
                 }
                 if search_after:
                     body["search_after"] = search_after
@@ -4430,13 +4609,18 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         return node_ids
 
     @staticmethod
-    def _edge_rank_key(edge: dict[str, Any]) -> tuple[int, float]:
-        """Rank traversal edges by shallower depth first, then higher weight."""
+    def _edge_depth(edge: dict[str, Any]) -> int:
+        """Traversal depth of an edge row, defaulting to 0 when unusable."""
         depth = edge.get("_depth", edge.get("depth", 0))
         try:
-            depth_value = int(depth)
+            return int(depth)
         except (TypeError, ValueError):
-            depth_value = 0
+            return 0
+
+    @staticmethod
+    def _edge_rank_key(edge: dict[str, Any]) -> tuple[int, float]:
+        """Rank traversal edges by shallower depth first, then higher weight."""
+        depth_value = OpenSearchGraphStorage._edge_depth(edge)
 
         weight = edge.get("weight", 0)
         try:
@@ -4445,6 +4629,45 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             weight_value = 0.0
 
         return (depth_value, -weight_value)
+
+    async def _extend_with_existing_nodes(
+        self,
+        candidate_ids: list[str],
+        limit: int,
+        result: KnowledgeGraph,
+        accepted: list[str],
+    ) -> None:
+        """Append the candidates that really have node documents, up to `limit`.
+
+        `mget` answers in request order, so consuming it in order preserves
+        whatever ranking `candidate_ids` arrived in.
+
+        Asks for the current shortfall first and for the remainder only if that
+        did not fill it, so at most two round trips. Requesting the whole list
+        up front would fetch a document per candidate: filling the handful of
+        slots a few dangling ids vacated would pull the entire rest of the
+        ranked band, up to `limit` documents, to place a few nodes. On the
+        first (cutoff-sized) call the shortfall IS the whole list, so that one
+        stays a single mget.
+        """
+        if not candidate_ids or len(accepted) >= limit:
+            return
+
+        head = candidate_ids[: limit - len(accepted)]
+        # Two chunks, never more: chunking per shortfall in a loop would degrade
+        # to a round trip per remaining slot when most of the band is dangling.
+        for chunk in (head, candidate_ids[len(head) :]):
+            if not chunk or len(accepted) >= limit:
+                break
+            resp = await self.client.mget(index=self._nodes_index, body={"ids": chunk})
+            for doc in resp["docs"]:
+                if len(accepted) >= limit:
+                    break
+                if doc.get("found"):
+                    accepted.append(doc["_id"])
+                    result.nodes.append(
+                        self._construct_graph_node(doc["_id"], doc["_source"])
+                    )
 
     async def _append_edges_between_nodes(
         self, node_ids: list[str], result: KnowledgeGraph
@@ -4615,32 +4838,64 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     degree_map[bucket["key"]] = (
                         degree_map.get(bucket["key"], 0) + bucket["doc_count"]
                     )
-                top_ids = sorted(degree_map, key=degree_map.get, reverse=True)[
-                    :max_nodes
-                ]
-                if len(top_ids) < max_nodes:
-                    top_ids.extend(
-                        await self._collect_node_ids(
-                            max_nodes - len(top_ids), exclude_ids=set(top_ids)
-                        )
-                    )
-            else:
-                top_ids = await self._collect_node_ids(max_nodes)
-
-            # Fetch node data
-            if top_ids:
-                node_resp = await self.client.mget(
-                    index=self._nodes_index, body={"ids": top_ids}
+                # Degree descending, then label ascending — the BaseGraphStorage
+                # tie-break, and the same ordering get_popular_labels uses.
+                # Sorting on the degree alone is stable, so the equal-degree
+                # band at the max_nodes cutoff was cut in aggregation bucket
+                # order: which entities the caller saw depended on how the
+                # buckets happened to come back.
+                #
+                # Exact WITHIN degree_map, which is itself approximate, so the
+                # ranking on this backend is too (#3613). Each aggregation above
+                # returns only its own top max_nodes buckets, so an entity whose
+                # in- and out-degree each fall outside their respective top-N
+                # never reaches this sort however high its undirected degree is;
+                # and terms aggregations are count-approximate across shards, so
+                # the degrees themselves can be off. Neither is fixable here --
+                # the data the sort would need never reaches the client.
+                ranked_ids = sorted(
+                    degree_map, key=lambda label: (-degree_map[label], label)
                 )
-                found_node_ids = []
-                for doc in node_resp["docs"]:
-                    if doc.get("found"):
-                        found_node_ids.append(doc["_id"])
-                        result.nodes.append(
-                            self._construct_graph_node(doc["_id"], doc["_source"])
-                        )
+            else:
+                # Everything fits, so this takes every node it can reach and the
+                # scan order cannot change the answer: no `ordered` needed.
+                ranked_ids = await self._collect_node_ids(max_nodes)
 
-                await self._append_edges_between_nodes(found_node_ids, result)
+            # Resolve existence BEFORE applying the cutoff, the rule _bfs_subgraph
+            # already follows: these ids are edge ENDPOINTS, and upsert_edge only
+            # guarantees the source node exists, so a candidate can be a dangling
+            # id with no node document. Slicing first let such an id consume a
+            # real node's slot and shrink the answer -- reachable as soon as ties
+            # break on the label, because a dangling label sorts like any other.
+            accepted_ids: list[str] = []
+            await self._extend_with_existing_nodes(
+                ranked_ids[:max_nodes], max_nodes, result, accepted_ids
+            )
+            if len(accepted_ids) < max_nodes:
+                # Refill from the rest of the ranked band first: falling straight
+                # through to the node-index top-up below would replace a dropped
+                # candidate with an arbitrary node instead of the next-ranked one.
+                await self._extend_with_existing_nodes(
+                    ranked_ids[max_nodes:], max_nodes, result, accepted_ids
+                )
+            if result.is_truncated and len(accepted_ids) < max_nodes:
+                # The ranked band only names entities that appear in the edge
+                # index; isolated ones fill whatever it left over. `ordered`
+                # because this scan stops as soon as the slots are full and its
+                # candidates all tie at degree 0 -- the visit order IS the
+                # tie-break here, and neither default scan path provides one.
+                await self._extend_with_existing_nodes(
+                    await self._collect_node_ids(
+                        max_nodes - len(accepted_ids),
+                        exclude_ids=set(accepted_ids),
+                        ordered=True,
+                    ),
+                    max_nodes,
+                    result,
+                    accepted_ids,
+                )
+
+            await self._append_edges_between_nodes(accepted_ids, result)
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
@@ -4730,9 +4985,12 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             )
             return await self._bfs_subgraph(start_label, max_depth, max_nodes)
 
-        ordered_node_ids = [start_label]
+        # _edge_rank_key settles depth but leaves same-depth nodes in edge-weight
+        # order, so bucket by depth and rank each bucket on the node instead.
+        levels: dict[int, list[str]] = {}
         discovered_nodes = {start_label}
         for edge_row in sorted_edge_rows:
+            depth = self._edge_depth(edge_row)
             for node_id in (
                 edge_row.get("source_node_id"),
                 edge_row.get("target_node_id"),
@@ -4740,8 +4998,39 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 if not node_id or node_id in discovered_nodes:
                     continue
                 discovered_nodes.add(node_id)
-                if len(ordered_node_ids) < max_nodes:
-                    ordered_node_ids.append(node_id)
+                levels.setdefault(depth, []).append(node_id)
+
+        # Only the level straddling the cap competes for the remaining slots:
+        # shallower levels are admitted whole and deeper ones never survive, so
+        # ranking either would cost terms/bucket budget for no change in output.
+        degrees: dict[str, int] = {}
+        if len(discovered_nodes) > max_nodes:
+            remaining = max_nodes - 1
+            for depth in sorted(levels):
+                # No slots left: this level and every deeper one are sliced off
+                # whole by `ranked[: max_nodes - 1]` below, so ranking them
+                # cannot change the output. Also covers max_nodes <= 1, where
+                # nothing but start_label is ever admitted.
+                if remaining <= 0:
+                    break
+                level = levels[depth]
+                if len(level) > remaining:
+                    degrees = await self.node_degrees_batch(
+                        level[:_GRAPH_DEGREE_RANK_MAX_CANDIDATES]
+                    )
+                    break
+                remaining -= len(level)
+
+        ranked = [
+            node_id
+            for depth in sorted(levels)
+            for node_id in sorted(
+                levels[depth], key=lambda nid: (-degrees.get(nid, 0), nid)
+            )
+        ]
+        # max(..., 0) keeps a max_nodes of 0 from slicing off the tail instead
+        # of admitting nothing.
+        ordered_node_ids = [start_label] + ranked[: max(max_nodes - 1, 0)]
 
         result.is_truncated = len(discovered_nodes) > max_nodes
 
@@ -4854,6 +5143,32 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     if doc.get("found") and doc["_id"] not in seen_nodes
                 ]
 
+            # mget answers in request order, so an overflowing level needs the
+            # contract's ranking before the cap reads it. Only an overflowing
+            # level pays: a level that fits is admitted whole, and the contract
+            # binds which nodes survive, not their order.
+            # The candidate cap matters more here than on the PPL path: the
+            # level edge query asks for `size: 10000`, so a level can carry up
+            # to ~20k endpoints, past both `index.max_terms_count` and the
+            # bucket budget the degree aggregations request.
+            # Gate on the slots actually left rather than on level overflow
+            # alone: once the cap is full nothing here can be admitted, so the
+            # ranking would buy an aggregation over up to
+            # _GRAPH_DEGREE_RANK_MAX_CANDIDATES ids and change no output. The
+            # mget above stays unconditional -- a full-cap level still has to
+            # resolve real nodes to report truncation honestly.
+            remaining = max_nodes - len(seen_nodes)
+            if 0 < remaining < len(real_docs):
+                level_degrees = await self.node_degrees_batch(
+                    [
+                        doc["_id"]
+                        for doc in real_docs[:_GRAPH_DEGREE_RANK_MAX_CANDIDATES]
+                    ]
+                )
+                real_docs.sort(
+                    key=lambda doc: (-level_degrees.get(doc["_id"], 0), doc["_id"])
+                )
+
             new_docs = []
             for doc in real_docs:
                 if len(seen_nodes) + len(new_docs) >= max_nodes:
@@ -4866,6 +5181,14 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 result.nodes.append(
                     self._construct_graph_node(doc["_id"], doc["_source"])
                 )
+
+            # Truncation is already proven, so the next level cannot admit
+            # anything and its edge query + mget would buy nothing. Note the
+            # condition: breaking on `len(seen_nodes) >= max_nodes` instead
+            # would skip the probe that turns an exact fill into a truthful
+            # is_truncated, which is exactly the level this loop must still see.
+            if truncated_by_cap:
+                break
 
             current_level = [doc["_id"] for doc in new_docs]
 
@@ -4975,9 +5298,76 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error getting all edges: {e}")
             raise
 
+    async def _collect_isolated_labels(
+        self, needed: int, connected: set[str]
+    ) -> list[str]:
+        """Scan the node index in label order for entities that have no edges.
+
+        Only reached when the connected entities do not already fill the caller's
+        limit, so a large graph never pays for this pass. The scan stops as soon
+        as ``needed`` labels are collected, which is what makes the scan order
+        load-bearing: these labels all tie at degree 0, so the order they are
+        visited in IS the tie-break, and it must be ``entity_id`` ascending like
+        every other backend's.
+
+        That is why the sort is spelled out here instead of reusing
+        ``_pit_sort_with_field``: that helper is a pagination tiebreaker and
+        collapses to ``_shard_doc`` on OpenSearch >= 3.3, i.e. shard order.
+        ``get_all_labels`` can use it because it reads every page and re-sorts in
+        Python afterwards; an early-exit scan cannot — it would return an
+        arbitrary shard-ordered subset and omit alphabetically earlier labels.
+        ``entity_id`` is unique (it mirrors ``_id``), so it is a total order and
+        needs no extra tiebreaker for ``search_after``.
+        """
+        if needed <= 0:
+            return []
+        await self._refresh_graph_indices_if_dirty(refresh_nodes=True)
+        isolated: list[str] = []
+        pit = await self.client.create_pit(
+            index=self._nodes_index, params={"keep_alive": "1m"}
+        )
+        pit_id = pit["pit_id"]
+        try:
+            search_after = None
+            while len(isolated) < needed:
+                body = {
+                    "query": {"match_all": {}},
+                    "_source": False,
+                    "size": 10000,
+                    "pit": {"id": pit_id, "keep_alive": "1m"},
+                    "sort": [{"entity_id": {"order": "asc"}}],
+                }
+                if search_after:
+                    body["search_after"] = search_after
+                response = await self.client.search(body=body)
+                hits = response["hits"]["hits"]
+                if not hits:
+                    break
+                for hit in hits:
+                    if hit["_id"] not in connected:
+                        isolated.append(hit["_id"])
+                        if len(isolated) >= needed:
+                            break
+                search_after = hits[-1]["sort"]
+                if len(hits) < 10000:
+                    break
+        finally:
+            try:
+                await self.client.delete_pit(body={"pit_id": [pit_id]})
+            except Exception:
+                pass
+        return isolated
+
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
-        """Get node labels ranked by edge degree (most connected first)."""
-        if not self._indices_ready:
+        """Get node labels ranked by edge degree (most connected first).
+
+        Isolated (degree-0) entities rank last but are still returned: the
+        degree aggregation runs on the edge index, where an entity with no
+        relations has no document at all, so ranking from the edge side alone
+        silently excluded them. NetworkXStorage ranks the whole node set, and a
+        graph whose entities carry no relations must not report an empty list.
+        """
+        if not self._indices_ready or limit <= 0:
             return []
         try:
             await self._refresh_graph_indices_if_dirty(refresh_edges=True)
@@ -4989,6 +5379,13 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 },
             }
             response = await self.client.search(index=self._edges_index, body=body)
+            # Keyed on edge ENDPOINTS, so an id with edge documents but no node
+            # document (a dangling endpoint, only reachable as a data-quality
+            # defect — the write path materializes both endpoints) also surfaces
+            # here. Left in deliberately: confirming every ranked id against the
+            # node index costs a round trip on every call, and the worst case is
+            # a picker entry whose entity lookup comes back empty, which the
+            # client reports rather than crashes on.
             degree_map = {}
             for bucket in response["aggregations"]["src"]["buckets"]:
                 degree_map[bucket["key"]] = (
@@ -4998,7 +5395,20 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 degree_map[bucket["key"]] = (
                     degree_map.get(bucket["key"], 0) + bucket["doc_count"]
                 )
-            sorted_labels = sorted(degree_map, key=degree_map.get, reverse=True)[:limit]
+            # Ties break on the label, ascending — the ordering the SQL and
+            # Cypher backends use, rather than aggregation bucket order.
+            sorted_labels = sorted(
+                degree_map, key=lambda label: (-degree_map[label], label)
+            )[:limit]
+            if len(sorted_labels) >= limit:
+                # Every remaining slot would go to a degree-0 node anyway, and
+                # there are none left to fill: skip the node scan entirely.
+                return sorted_labels
+            sorted_labels.extend(
+                await self._collect_isolated_labels(
+                    limit - len(sorted_labels), set(degree_map)
+                )
+            )
             return sorted_labels
         except OpenSearchException as e:
             if _is_missing_index_error(e):

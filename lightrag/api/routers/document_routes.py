@@ -5,6 +5,7 @@ This module contains all document-related routes for the LightRAG API.
 import asyncio
 import base64
 import binascii
+import errno
 import math
 import os
 import re
@@ -84,6 +85,7 @@ from lightrag.constants import (
     MAX_R_SEPARATORS,
     PARSED_ARTIFACT_DIR_SUFFIXES,
     PARSED_DIR_NAME,
+    PROCESS_OPTION_CHUNK_CUSTOM,
     PROCESS_OPTION_CHUNK_FIXED,
     PROCESS_OPTION_CHUNK_PARAGRAH,
     PROCESS_OPTION_CHUNK_RECURSIVE,
@@ -104,6 +106,7 @@ from lightrag.kg.scan_job_store import (
 )
 from lightrag.parser.routing import (
     FilenameParserHintError,
+    ParserDirectives,
     canonicalize_parser_hinted_basename,
     chunk_strategy_key,
     encode_parse_engine,
@@ -114,6 +117,7 @@ from lightrag.parser.routing import (
 from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
+    validate_file_path_security,
 )
 from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
@@ -166,6 +170,79 @@ ARCHIVED_FILE_SUFFIX_RE = re.compile(r"_(?:\d{3}|\d{10,})$")
 _ADMISSION_RETRY_AFTER_SECONDS = 30
 
 
+# Characters a document source must not carry. Stricter than the graph-attribute
+# rule in ``lightrag.utils`` on purpose: tab/newline/carriage return are legal
+# XML and legal in a description, but a *filename* holding one is pathological,
+# and ``sanitize_filename`` has always refused them. Surrogates and the
+# non-characters are the additions -- they reach a filename through
+# ``surrogateescape`` decoding of a non-UTF-8 multipart header, and they are
+# exactly as unserializable as a control character once the value is stamped
+# onto graph nodes.
+_UNSAFE_DOCUMENT_SOURCE_CHAR_PATTERN = re.compile(
+    "[\u0000-\u001f\u007f\ud800-\udfff\ufffe\uffff]"
+)
+
+
+def find_unsafe_document_source_character(value: str) -> str | None:
+    """Return the first character that disqualifies *value* as a document source.
+
+    A document source is not only a display string: it is stamped onto the
+    ``file_path`` attribute of every entity and relation extracted from the
+    document. Nothing downstream cleans it -- the extraction handlers pass
+    ``file_path`` through untouched, unlike ``description`` / ``entity_type`` /
+    ``keywords``, which all go through ``sanitize_text_for_encoding``. So a value
+    accepted here is a value the graph backends must be able to store, and one
+    they cannot store takes out writes for the whole instance on NetworkX (see
+    GHSA-c922-pw4m-4wcv).
+
+    Rejecting rather than rewriting, for the reason ``sanitize_filename``
+    already gives: the source doubles as a document identifier, a dedup key and
+    the ``doc_id`` seed, so silently rewriting it would change document identity
+    and could collide with a legitimate document.
+
+    Args:
+        value: Candidate document source (uploaded filename or ``file_source``).
+
+    Returns:
+        The offending character, or ``None`` when the value is usable.
+    """
+    match = _UNSAFE_DOCUMENT_SOURCE_CHAR_PATTERN.search(value)
+    return match.group() if match else None
+
+
+def reject_unsafe_document_source(value: str | None) -> str | None:
+    """Raise ``ValueError`` when *value* holds a character a source may not carry.
+
+    Shaped for a Pydantic field validator (the one place ``/documents/text`` and
+    ``/documents/texts`` both pass through); ``sanitize_filename`` performs the
+    same check but raises ``HTTPException`` to match the rest of the upload path.
+    """
+    if value is None:
+        return None
+    offender = find_unsafe_document_source_character(value)
+    if offender is not None:
+        raise ValueError(
+            f"file_source must not contain the character U+{ord(offender):04X}"
+        )
+    return value
+
+
+def describe_rejected_document_source(value: str) -> str:
+    """Render a rejected source safely for a log line or operator message.
+
+    A value ``find_unsafe_document_source_character`` rejects may hold a lone
+    surrogate — that is how a directory entry whose bytes are not valid UTF-8
+    reaches Python, via ``surrogateescape``. Interpolating it raw into a scan
+    warning would carry it into ``pipeline_status`` history and the scan job's
+    bounded samples, and both are rendered by Starlette's ``JSONResponse`` with
+    ``json.dumps(..., ensure_ascii=False).encode("utf-8")`` — which *raises* on
+    a lone surrogate. The rejected file would then take out every later read of
+    ``/documents/pipeline_status`` and ``/documents/scan/status``. ``ascii()``
+    keeps the name recognisable while guaranteeing the message is pure ASCII.
+    """
+    return ascii(value)
+
+
 def normalize_file_path(file_path: str | None) -> str:
     """Normalize missing document sources to a single non-null sentinel."""
     if file_path is None:
@@ -186,47 +263,114 @@ def is_valid_file_source(file_source: str | None) -> bool:
 
 def sanitize_filename(filename: str, input_dir: Path) -> str:
     """
-    Sanitize uploaded filename to prevent Path Traversal attacks.
+    Validate an uploaded filename and return it unchanged when safe.
+
+    Uploaded filenames are document identifiers as well as on-disk names, so
+    unsafe names must be rejected rather than rewritten. Rewriting values such
+    as ``../report.pdf`` to ``report.pdf`` can hide malicious input, collide
+    with a legitimate document, and make audit logs misleading.
 
     Args:
         filename: The original filename from the upload
         input_dir: The target input directory
 
     Returns:
-        str: Sanitized filename that is safe to use
+        str: The original filename after safety validation
 
     Raises:
         HTTPException: If the filename is unsafe or invalid
     """
-    # Basic validation
     if not filename or not filename.strip():
         raise HTTPException(status_code=400, detail="Filename cannot be empty")
 
-    # Remove path separators and traversal sequences
-    clean_name = filename.replace("/", "").replace("\\", "")
-    clean_name = clean_name.replace("..", "")
+    if filename != filename.strip():
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
-    # Remove control characters and null bytes
-    clean_name = "".join(c for c in clean_name if ord(c) >= 32 and c != "\x7f")
+    # Shared with the ``file_source`` body fields so both ingress paths agree on
+    # what a document source may contain -- see
+    # ``find_unsafe_document_source_character``.
+    if find_unsafe_document_source_character(filename) is not None:
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
-    # Remove leading/trailing whitespace and dots
-    clean_name = clean_name.strip().strip(".")
+    if "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Unsafe filename detected")
 
-    # Check if anything is left after sanitization
-    if not clean_name:
-        raise HTTPException(
-            status_code=400, detail="Invalid filename after sanitization"
-        )
+    # ':' lets a name be parsed as an NTFS alternate-data-stream reference
+    # (``safe.pdf:payload``) or a drive-relative path (``C:report.pdf``),
+    # breaking the "single literal basename" invariant this function
+    # enforces. The other Windows-reserved path characters don't carry that
+    # same reinterpretation risk in this codebase (filenames are never
+    # shelled out to, and glob() call sites already use glob.escape()), so
+    # they're left alone rather than rejected pre-emptively.
+    if ":" in filename:
+        raise HTTPException(status_code=400, detail="Unsafe filename detected")
 
-    # Verify the final path stays within the input directory
+    if filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Unsafe filename detected")
+
+    # Verify the final path stays within the input directory. This is a
+    # defense-in-depth check for platform-specific path parsing edge cases.
     try:
-        final_path = (input_dir / clean_name).resolve()
-        if not final_path.is_relative_to(input_dir.resolve()):
+        input_root = input_dir.resolve()
+        final_path = (input_root / filename).resolve()
+        if final_path.parent != input_root or not final_path.is_relative_to(input_root):
             raise HTTPException(status_code=400, detail="Unsafe filename detected")
     except (OSError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    return clean_name
+    return filename
+
+
+_UPLOAD_DIR_FD_SUPPORTED = os.open in os.supports_dir_fd
+
+
+def upload_file_opener(input_dir: Path):
+    """Return an opener that creates uploads safely below ``input_dir``.
+
+    The upload path is pre-validated as a single basename, but the final file
+    creation must also be fail-closed. Opening relative to a directory file
+    descriptor with exclusive creation prevents symlink-following overwrites
+    and closes the check/write race between duplicate detection and streaming.
+
+    dir_fd-relative opens require openat() (os.supports_dir_fd); Windows has
+    neither that nor a way to os.open() a directory at all, so on platforms
+    without the capability this falls back to opening the full path directly
+    with O_CREAT | O_EXCL (+ O_NOFOLLOW where available) and no directory
+    binding.
+    """
+
+    if not _UPLOAD_DIR_FD_SUPPORTED:
+
+        def opener(path: str, flags: int) -> int:
+            open_flags = flags | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                open_flags |= os.O_NOFOLLOW
+            return os.open(path, open_flags, 0o600)
+
+        return opener
+
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    dir_fd = os.open(input_dir, directory_flags)
+
+    def opener(path: str, flags: int) -> int:
+        nonlocal dir_fd
+        try:
+            open_flags = flags | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                open_flags |= os.O_NOFOLLOW
+            return os.open(
+                os.path.basename(path),
+                open_flags,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        finally:
+            os.close(dir_fd)
+            dir_fd = -1
+
+    return opener
 
 
 class ScanResponse(BaseModel):
@@ -474,6 +618,7 @@ TextChunkingStrategy = Literal[
     "recursive_character",
     "semantic_vector",
     "paragraph_semantic",
+    "custom",
 ]
 
 
@@ -618,6 +763,10 @@ _CHUNKING_PARAMS_MODEL: dict[str, type[_StrictChunkParams]] = {
     "recursive_character": RecursiveCharacterChunkParams,
     "semantic_vector": SemanticVectorChunkParams,
     "paragraph_semantic": ParagraphSemanticChunkParams,
+    # ``custom`` invokes LightRAG.chunking_func with the historical six
+    # arguments, so its request parameters are exactly the fixed-token fields
+    # that populate that signature.
+    "custom": FixedTokenChunkParams,
 }
 
 
@@ -628,6 +777,11 @@ class TextChunkingConfig(BaseModel):
     keys, wrong types, and out-of-range values all raise synchronously
     during request parsing (HTTP 422) — never later in the background
     indexing task, where the HTTP response has already been sent.
+
+    ``custom`` explicitly invokes ``LightRAG.chunking_func`` and reuses the
+    fixed-token parameter contract (split character, split-only flag, overlap,
+    and size). It is rejected unless the application injected a non-default
+    callback.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -683,6 +837,11 @@ class InsertTextRequest(BaseModel):
     @field_validator("file_source", mode="before")
     @classmethod
     def normalize_source_before(cls, file_source: Optional[str]) -> str:
+        # Reject before normalizing: `normalize_file_path` is also used on read
+        # paths (building document listings from stored values), so it must stay
+        # non-raising -- a document already holding a bad source has to remain
+        # listable and deletable.
+        reject_unsafe_document_source(file_source)
         return normalize_file_path(file_source)
 
     model_config = ConfigDict(
@@ -740,6 +899,10 @@ class InsertTextsRequest(BaseModel):
         if file_sources is None:
             return None
 
+        # See TextRequest.normalize_source_before for why the rejection is here
+        # and not inside normalize_file_path.
+        for file_source in file_sources:
+            reject_unsafe_document_source(file_source)
         return [normalize_file_path(file_source) for file_source in file_sources]
 
     model_config = ConfigDict(
@@ -1454,7 +1617,9 @@ class DocumentManager:
     def mark_as_indexed(self, file_path: Path):
         self.indexed_files.add(file_path)
 
-    def is_supported_file(self, filename: str) -> bool:
+    def is_supported_file(
+        self, filename: str, *, directives: ParserDirectives | None = None
+    ) -> bool:
         """True when THIS filename routes to an engine that can parse it.
 
         Resolves the engine for the concrete name — so a per-file hint
@@ -1463,9 +1628,15 @@ class DocumentManager:
         default ``legacy`` engine is rejected here instead of failing later
         at the parse worker's suffix gate.
 
+        ``directives`` lets a caller that already resolved this filename
+        (upload does, to gate the ``C`` selector) reuse that resolution
+        instead of paying a second hint parse plus rule scan.
+
         Raises :class:`FilenameParserHintError` for a malformed hint —
         callers surface it (upload → HTTP 400 with the detailed message;
         scan passes the file through so enqueue emits an error document).
+        A caller passing ``directives`` has already resolved (and therefore
+        already surfaced) that error, so nothing is raised on that path.
         """
         from lightrag.parser.routing import (
             parser_engine_supports_suffix,
@@ -1473,62 +1644,12 @@ class DocumentManager:
             resolve_file_parser_engine,
         )
 
-        engine = resolve_file_parser_engine(filename)
+        engine = (
+            directives.engine
+            if directives is not None
+            else resolve_file_parser_engine(filename)
+        )
         return parser_engine_supports_suffix(engine, parser_suffix(filename))
-
-
-def validate_file_path_security(file_path_str: str, base_dir: Path) -> Optional[Path]:
-    """
-    Validate file path security to prevent Path Traversal attacks.
-
-    Args:
-        file_path_str: The file path string to validate
-        base_dir: The base directory that the file must be within
-
-    Returns:
-        Path: Safe file path if valid, None if unsafe or invalid
-    """
-    if not file_path_str or not file_path_str.strip():
-        return None
-
-    try:
-        # Clean the file path string
-        clean_path_str = file_path_str.strip()
-
-        # Check for obvious path traversal patterns before processing
-        # This catches both Unix (..) and Windows (..\) style traversals
-        if ".." in clean_path_str:
-            # Additional check for Windows-style backslash traversal
-            if (
-                "\\..\\" in clean_path_str
-                or clean_path_str.startswith("..\\")
-                or clean_path_str.endswith("\\..")
-            ):
-                # logger.warning(
-                #     f"Security violation: Windows path traversal attempt detected - {file_path_str}"
-                # )
-                return None
-
-        # Normalize path separators (convert backslashes to forward slashes)
-        # This helps handle Windows-style paths on Unix systems
-        normalized_path = clean_path_str.replace("\\", "/")
-
-        # Create path object and resolve it (handles symlinks and relative paths)
-        candidate_path = (base_dir / normalized_path).resolve()
-        base_dir_resolved = base_dir.resolve()
-
-        # Check if the resolved path is within the base directory
-        if not candidate_path.is_relative_to(base_dir_resolved):
-            # logger.warning(
-            #     f"Security violation: Path traversal attempt detected - {file_path_str}"
-            # )
-            return None
-
-        return candidate_path
-
-    except (OSError, ValueError, Exception) as e:
-        logger.warning(f"Invalid file path detected: {file_path_str} - {str(e)}")
-        return None
 
 
 def get_doc_status_value(doc_status: Any) -> str:
@@ -2258,6 +2379,23 @@ async def pipeline_enqueue_file(
     if track_id is None:
         track_id = generate_track_id("unknown")
 
+    # Single chokepoint for every file-shaped ingest: refuse a basename that
+    # cannot survive as a document source before anything is written. Reachable
+    # only from a caller that has NOT validated (a scan whose classification was
+    # bypassed); ``/documents/upload`` already rejects at ``sanitize_filename``.
+    # No error document either — that would persist the offending name into
+    # ``doc_status.file_path``, which is the outcome this guard exists to
+    # prevent, and every error-document construction below (including the
+    # catch-all) interpolates ``file_path.name`` raw.
+    unsafe_char = find_unsafe_document_source_character(file_path.name)
+    if unsafe_char is not None:
+        logger.error(
+            "[File Extraction]Refusing file with an unsafe document source: "
+            f"{describe_rejected_document_source(file_path.name)} contains "
+            f"U+{ord(unsafe_char):04X}"
+        )
+        return False, track_id
+
     try:
         # File size is used only for error reporting. Scan-time mtime ordering
         # happens before this function, in the disk-backed candidate spool;
@@ -2495,7 +2633,27 @@ _STRATEGY_TO_PROCESS_OPTION: Dict[str, str] = {
     "recursive_character": PROCESS_OPTION_CHUNK_RECURSIVE,
     "semantic_vector": PROCESS_OPTION_CHUNK_VECTOR,
     "paragraph_semantic": PROCESS_OPTION_CHUNK_PARAGRAH,
+    "custom": PROCESS_OPTION_CHUNK_CUSTOM,
 }
+
+
+def _validate_custom_chunking_available(process_options: str, rag: LightRAG) -> None:
+    """Require an injected callback for synchronous user-facing ``C`` ingress.
+
+    Background scans and reprocessing intentionally do not call this helper:
+    they may encounter an already-persisted ``C`` document after the callback
+    was removed, and the processing pipeline has an observable fixed-token
+    fallback for that case.
+    """
+    if parse_process_options(process_options).chunking != PROCESS_OPTION_CHUNK_CUSTOM:
+        return
+
+    from lightrag.chunker import chunking_by_token_size
+
+    if getattr(rag, "chunking_func", chunking_by_token_size) is chunking_by_token_size:
+        raise ValueError(
+            "custom chunking requires a non-default LightRAG.chunking_func"
+        )
 
 
 def _resolve_text_chunking(
@@ -2533,6 +2691,7 @@ def _resolve_text_chunking(
         )
 
     process_options = _STRATEGY_TO_PROCESS_OPTION[chunking.strategy]
+    _validate_custom_chunking_available(process_options, rag)
     chunk_options = resolve_chunk_options(
         rag.addon_params, process_options=process_options
     )
@@ -2621,6 +2780,7 @@ async def pipeline_index_texts(
     file_sources: List[str] = None,
     track_id: str = None,
     chunking: Optional[TextChunkingConfig] = None,
+    resolved_chunking: Optional[tuple[str, dict]] = None,
     admission_token: str | None = None,
 ):
     """Index a list of texts with track_id
@@ -2632,6 +2792,10 @@ async def pipeline_index_texts(
         track_id: Optional tracking ID
         chunking: Optional chunking strategy + params (already validated by
             the request model); when None, default fixed-token chunking is used
+        resolved_chunking: Optional preflight-frozen ``(process_options,
+            chunk_options)`` snapshot. Request handlers pass this so accepted
+            work cannot be invalidated by a callback/config change before its
+            managed task starts. Direct callers may omit it to resolve here.
         admission_token: the endpoint's pending-enqueue reservation, forwarded so
             the admission guard re-weights that token to the deduped count
             (LR2 §9.2)
@@ -2648,7 +2812,10 @@ async def pipeline_index_texts(
     if len(set(normalized_file_sources)) != len(normalized_file_sources):
         raise ValueError("File sources must be unique by filename")
 
-    process_options, chunk_options = _resolve_text_chunking(chunking, rag)
+    if resolved_chunking is None:
+        process_options, chunk_options = _resolve_text_chunking(chunking, rag)
+    else:
+        process_options, chunk_options = resolved_chunking
     enqueue_kwargs: dict[str, Any] = {
         "input": texts,
         "file_paths": normalized_file_sources,
@@ -2870,11 +3037,12 @@ async def _renew_scan_job_lease(reporter: _ScanJobReporter, scan_task: Any) -> N
 
 
 class _ScanFileClass(str, Enum):
-    """The seven mutually exclusive scan classification exits (LR2 §8.3).
+    """The eight mutually exclusive scan classification exits (LR2 §8.3).
 
     Values double as the scan job's counter keys, so a ``/scan/status`` reader
     sees the taxonomy verbatim."""
 
+    UNSAFE_SOURCE = "unsafe_source"
     CLAIMED_NEW = "claimed_new"
     SOURCE_CONFLICT = "source_conflict"
     PROCESSED = "processed"
@@ -2940,7 +3108,12 @@ async def _row_source_file(rag: LightRAG, doc_id: str) -> str | None:
 async def classify_scan_file(
     rag: LightRAG, file_path: Path, canonical_source_key: str
 ) -> _ScanFileDecision:
-    """Classify one physical file into the seven §8.3 exits.
+    """Classify one physical file into the §8.3 exits below.
+
+    UNSAFE_SOURCE is decided by the caller before this function runs — it is a
+    property of the filename alone, needs no identity resolution, and must be
+    settled before any code path formats the raw name (see
+    ``describe_rejected_document_source``).
 
     Identity is resolved with ``resolve_doc_source_strict``: the doc ID is the
     identity every later operation uses, and the canonical basename only LOCATES
@@ -3684,6 +3857,35 @@ async def run_scanning_process(
                 # reaped to ABANDONED under a live owner.
                 reporter.renew()
                 filename = file_path.name
+
+                # §8.3.0 UNSAFE_SOURCE — FIRST, ahead of every other exit.
+                # Nothing between the filesystem and here filters characters:
+                # ``iter_new_files`` gates on suffix, and ``normalize_file_path``
+                # only strips a parser hint. The basename becomes the document's
+                # ``file_path``, which is stamped verbatim onto every entity and
+                # relation the document produces, so an unsafe name here is the
+                # same ingress hazard the upload and ``/documents/text`` paths
+                # reject (GHSA-c922-pw4m-4wcv).
+                #
+                # The file stays put, exactly as SOURCE_CONFLICT does: the
+                # basename is the document identity, dedup key and doc_id seed,
+                # so the fix is an operator renaming the file, not this scan
+                # rewriting it or hiding it in __parsed__. Being first also means
+                # no later exit ever formats the raw name into a warning, a job
+                # sample or a doc_status row.
+                unsafe_char = find_unsafe_document_source_character(filename)
+                if unsafe_char is not None:
+                    unsafe_detail = (
+                        "Skipping file with an unsafe document source: "
+                        f"{describe_rejected_document_source(filename)} contains "
+                        f"U+{ord(unsafe_char):04X}; rename it in the input "
+                        "directory to make it ingestible"
+                    )
+                    await record_scan_warning(rag, unsafe_detail)
+                    reporter.count(_ScanFileClass.UNSAFE_SOURCE.value)
+                    reporter.sample("warning", unsafe_detail)
+                    continue
+
                 canonical_key = normalize_file_path(str(file_path))
                 decision = await classify_scan_file(rag, file_path, canonical_key)
 
@@ -3997,6 +4199,9 @@ async def background_delete_documents(
 
             file_path = "#"
             try:
+                delete_physical_file = delete_file
+                file_preservation_reason = None
+
                 result = await rag.adelete_by_doc_id(
                     doc_id, delete_llm_cache=delete_llm_cache
                 )
@@ -4004,6 +4209,80 @@ async def background_delete_documents(
                     getattr(result, "file_path", "-") if "result" in locals() else "-"
                 )
                 if result.status == "success":
+                    if (
+                        delete_file
+                        and result.file_path
+                        and result.file_path != UNKNOWN_FILE_SOURCE
+                    ):
+                        try:
+                            # Duplicate-attempt and source-conflict rows share a
+                            # primary document's basename. Check ownership only
+                            # after the deleted row is gone so a post-parse
+                            # content duplicate, which owns its unique archive,
+                            # still removes that archive normally.
+                            #
+                            # resolve_doc_source_strict is the fail-closed
+                            # contract: a backend failure RAISES here. The
+                            # legacy get_doc_by_file_basename lookup swallows
+                            # query failures into a best-effort None on some
+                            # backends, which would read as "unreferenced" and
+                            # delete a file a live primary still uses.
+                            resolution = await rag.doc_status.resolve_doc_source_strict(
+                                result.file_path
+                            )
+                            if isinstance(resolution, SourceUnique):
+                                if resolution.doc_id == doc_id:
+                                    # The deleted row is still visible to the
+                                    # lookup (eventually-consistent index).
+                                    # Preserve: a stale leak beats deleting a
+                                    # file another writer may have claimed.
+                                    delete_physical_file = False
+                                    file_preservation_reason = (
+                                        "deleted row still visible to the "
+                                        "ownership lookup"
+                                    )
+                                else:
+                                    delete_physical_file = False
+                                    file_preservation_reason = (
+                                        "still referenced by document "
+                                        f"{resolution.doc_id}"
+                                    )
+                            elif isinstance(resolution, SourceConflict):
+                                delete_physical_file = False
+                                file_preservation_reason = (
+                                    "still referenced by conflicting documents "
+                                    f"{', '.join(resolution.sample_doc_ids)}"
+                                )
+                            elif not isinstance(
+                                resolution, SourceAbsent
+                            ):  # pragma: no cover - typed union
+                                # The raise is caught below and preserves the
+                                # file.
+                                raise TypeError(
+                                    "resolve_doc_source_strict returned "
+                                    f"{type(resolution).__name__}; expected "
+                                    "SourceAbsent | SourceUnique | SourceConflict"
+                                )
+                            # SourceAbsent: no primary references the basename
+                            # any more; the deleted row was its sole owner.
+                        except Exception as ownership_error:
+                            # Fail closed: a storage read failure must never
+                            # turn a successful record deletion into accidental
+                            # removal of a possibly shared physical file. Keep
+                            # the raw error in the log only; pipeline_status is
+                            # serialized into API responses.
+                            logger.error(
+                                "Ownership check failed for %s (%s): %s",
+                                doc_id,
+                                result.file_path,
+                                ownership_error,
+                            )
+                            delete_physical_file = False
+                            file_preservation_reason = (
+                                "ownership check failed: "
+                                f"{type(ownership_error).__name__}"
+                            )
+
                     successful_deletions.append(doc_id)
                     success_msg = (
                         f"Document deleted {i}/{total_docs}: {doc_id}[{file_path}]"
@@ -4014,7 +4293,7 @@ async def background_delete_documents(
 
                     # Handle file deletion if requested and source information is available
                     if (
-                        delete_file
+                        delete_physical_file
                         and result.file_path
                         and result.file_path != UNKNOWN_FILE_SOURCE
                     ):
@@ -4064,7 +4343,16 @@ async def background_delete_documents(
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = file_error_msg
                                 append_pipeline_history(pipeline_status, file_error_msg)
-                    elif delete_file:
+                    elif delete_file and not delete_physical_file:
+                        file_preserved_msg = (
+                            f"Source file preserved for {doc_id}: {result.file_path} "
+                            f"({file_preservation_reason})"
+                        )
+                        logger.info(file_preserved_msg)
+                        async with pipeline_status_lock:
+                            pipeline_status["latest_message"] = file_preserved_msg
+                            append_pipeline_history(pipeline_status, file_preserved_msg)
+                    elif delete_physical_file:
                         no_file_msg = (
                             f"File deletion skipped, missing file path: {doc_id}"
                         )
@@ -4979,9 +5267,11 @@ def create_document_routes(
                 - status="success": File accepted and queued for processing
 
         Raises:
-            HTTPException: 400 unsupported file type, 409 same-name
-                conflict or scan-classifying / destructive job in
-                flight, 413 file too large, 500 other errors.
+            HTTPException: 400 unsupported file type or malformed filename
+                hint, 409 same-name conflict or scan-classifying /
+                destructive job in flight, 413 file too large, 422 invalid
+                chunking configuration (an explicit ``C`` selector without a
+                custom ``LightRAG.chunking_func``), 500 other errors.
         """
         from lightrag.kg.shared_storage import start_reserved_background_task
 
@@ -5004,17 +5294,36 @@ def create_document_routes(
             # Sanitize filename to prevent Path Traversal attacks
             safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
 
+            # Resolve engine + process options once and reuse the result for
+            # both gates below; each resolution costs a hint parse plus a
+            # LIGHTRAG_PARSER rule scan.
             try:
-                filename_supported = doc_manager.is_supported_file(safe_filename)
+                upload_directives = resolve_parser_directives(safe_filename)
             except FilenameParserHintError as hint_error:
                 # Reject malformed hints synchronously with the detailed
                 # message (previously surfaced asynchronously as an error
                 # document after the upload was accepted).
                 raise HTTPException(status_code=400, detail=str(hint_error))
-            if not filename_supported:
+
+            if not doc_manager.is_supported_file(
+                safe_filename, directives=upload_directives
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                )
+
+            # Unlike scans/reprocessing, this request has a caller to correct
+            # an unusable explicit ``C`` selector. Reject before writing the
+            # upload rather than silently accepting work that must fall back.
+            try:
+                _validate_custom_chunking_available(
+                    upload_directives.process_options, rag
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid chunking configuration: {exc}",
                 )
 
             # Check file size limit (if configured)
@@ -5082,25 +5391,62 @@ def create_document_routes(
             chunk_size = 1024 * 1024  # 1MB chunks
             needs_cleanup = False
 
-            async with aiofiles.open(file_path, "wb") as out_file:
-                while True:
-                    # Read chunk from upload stream
-                    chunk = await file.read(chunk_size)
-                    if not chunk:
-                        break
+            upload_opener = upload_file_opener(doc_manager.input_dir)
+            out_file_context = aiofiles.open(file_path, "xb", opener=upload_opener)
 
-                    # Check size limit during streaming (if not checked before)
-                    if (
-                        global_args.max_upload_size is not None
-                        and global_args.max_upload_size > 0
-                    ):
-                        bytes_written += len(chunk)
-                        if bytes_written > global_args.max_upload_size:
-                            needs_cleanup = True
+            opened = False
+            try:
+                async with out_file_context as out_file:
+                    opened = True
+                    while True:
+                        # Read chunk from upload stream
+                        chunk = await file.read(chunk_size)
+                        if not chunk:
                             break
 
-                    # Write chunk to file
-                    await out_file.write(chunk)
+                        # Check size limit during streaming (if not checked before)
+                        if (
+                            global_args.max_upload_size is not None
+                            and global_args.max_upload_size > 0
+                        ):
+                            bytes_written += len(chunk)
+                            if bytes_written > global_args.max_upload_size:
+                                needs_cleanup = True
+                                break
+
+                        # Write chunk to file
+                        await out_file.write(chunk)
+
+            except OSError as e:
+                if not opened:
+                    if isinstance(e, FileExistsError) or e.errno == errno.ELOOP:
+                        # The O_EXCL/O_NOFOLLOW conflict this opener exists to
+                        # enforce (name already taken, or refused to follow a
+                        # symlink). No file was created.
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Input directory already contains '{safe_filename}' or the "
+                                "upload path is unsafe. Remove it before re-uploading."
+                            ),
+                        ) from e
+                    # A genuine server-side open failure (permission denied,
+                    # ENOSPC/EDQUOT, read-only filesystem, ...) rather than a
+                    # name conflict. No file was created, nothing to clean up.
+                    raise
+                # Failure after the file was already created (e.g. ENOSPC/EIO
+                # during write or close) is a server-side fault, not a
+                # client-fixable conflict -- clean up the partial file so a
+                # retry isn't permanently blocked by the exclusive-create
+                # check, then let it propagate to the endpoint's
+                # internal_server_error(e) path.
+                try:
+                    file_path.unlink()
+                except OSError as cleanup_error:
+                    logger.error(
+                        f"Error cleaning up partially written file {safe_filename}: {cleanup_error}"
+                    )
+                raise
 
             # Cleanup after file is closed
             if needs_cleanup:
@@ -5244,10 +5590,11 @@ def create_document_routes(
             # Resolve + validate chunking synchronously so an invalid
             # effective config (e.g. chunk_token_size below the inherited
             # overlap) fails with HTTP 422 here, before any background work is
-            # scheduled. pipeline_index_texts re-resolves from the same
-            # addon_params inside the task.
+            # scheduled. Keep the returned snapshot: the callback/config may
+            # change before the managed task starts, but an accepted request
+            # must enqueue the exact options that passed this preflight.
             try:
-                _resolve_text_chunking(request.chunking, rag)
+                resolved_chunking = _resolve_text_chunking(request.chunking, rag)
             except ValueError as exc:
                 # Controlled chunking-config validation message (numeric sizes
                 # only, no internal detail); kept as client-facing 422 feedback
@@ -5272,6 +5619,7 @@ def create_document_routes(
                         file_sources=[normalized_file_source],
                         track_id=track_id,
                         chunking=request.chunking,
+                        resolved_chunking=resolved_chunking,
                         admission_token=enqueue_token,
                     )
                 finally:
@@ -5399,10 +5747,11 @@ def create_document_routes(
             # Resolve + validate the shared chunking synchronously so an
             # invalid effective config (e.g. chunk_token_size below the
             # inherited overlap) fails with HTTP 422 here, before any
-            # background work is scheduled. pipeline_index_texts re-resolves
-            # from the same addon_params inside the task.
+            # background work is scheduled. Keep the returned snapshot: the
+            # callback/config may change before the managed task starts, but an
+            # accepted request must enqueue the exact options from preflight.
             try:
-                _resolve_text_chunking(request.chunking, rag)
+                resolved_chunking = _resolve_text_chunking(request.chunking, rag)
             except ValueError as exc:
                 # Controlled chunking-config validation message (numeric sizes
                 # only, no internal detail); kept as client-facing 422 feedback
@@ -5434,6 +5783,7 @@ def create_document_routes(
                         file_sources=normalized_file_sources,
                         track_id=track_id,
                         chunking=request.chunking,
+                        resolved_chunking=resolved_chunking,
                         admission_token=enqueue_token,
                     )
                 finally:
@@ -5822,19 +6172,9 @@ def create_document_routes(
             )
 
             # Get update flags status for all namespaces
-            update_status = await get_all_update_flags_status(workspace=rag.workspace)
-
-            # Convert MutableBoolean objects to regular boolean values
-            processed_update_status = {}
-            for namespace, flags in update_status.items():
-                processed_flags = []
-                for flag in flags:
-                    # Handle both multiprocess and single process cases
-                    if hasattr(flag, "value"):
-                        processed_flags.append(bool(flag.value))
-                    else:
-                        processed_flags.append(bool(flag))
-                processed_update_status[namespace] = processed_flags
+            processed_update_status = await get_all_update_flags_status(
+                workspace=rag.workspace
+            )
 
             async with pipeline_status_lock:
                 # DictProxy.copy() is one Manager RPC; dict(proxy) may fetch

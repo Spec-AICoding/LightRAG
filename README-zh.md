@@ -220,7 +220,7 @@ make env-security-check # 可选：审计当前 .env 中的安全风险
 Native docx 解析器的可选引擎参数 `smart_heading` 使用 spaCy 做分句/NER 启发式判断。spaCy 运行时已包含在 `api` extra 中——只有两个钉定版本的语言模型（`zh_core_web_sm` / `en_core_web_sm` 3.8.0，GitHub release wheel，未发布到 PyPI）需要额外一步安装：
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 可以按文件/规则启用 smart_heading（如 `LIGHTRAG_PARSER=docx:native(smart_heading=true)`），也可以在 `.env` 中全局启用：
@@ -232,6 +232,27 @@ DOCX_SMART_HEADING=true
 ```
 
 全局开关开启（或 `LIGHTRAG_PARSER` 规则携带 `native(smart_heading=true)`）时，服务器会在启动阶段校验模型并在缺失时立即报错（附安装指引）。从不启用 smart_heading 的部署无需安装模型。Docker 主镜像已内置模型（lite 镜像不含）；离线环境请参阅[离线部署指南](./docs/OfflineDeployment.md)。
+
+### 可选：SVG 栅格化所需的 libcairo（native md/textpack）
+
+Native markdown/textpack 解析器会通过 `cairosvg` 把内嵌的 SVG 图片栅格化为 PNG。`cairosvg` 是对 cairo 的 cffi 绑定：`pip install cairosvg`（随 `api` extra 一起安装）总能成功，但只有宿主机同时装了原生的 `libcairo` 共享库，栅格化才真正能跑——`pip`/`uv` 装不了系统库。缺失时栅格化会在运行时失败，对应的 SVG 会被跳过（不影响文档其余内容）；服务器会在启动时探测这一能力，缺失时以醒目的黄色警告提示，避免这个缺口一直藏到某篇文档处理时才被发现。
+
+按平台安装对应的系统包：
+
+```bash
+# Debian / Ubuntu（官方 Docker 镜像已内置）
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS（Homebrew）
+brew install cairo
+
+# Windows：安装内含 libcairo-2.dll 的 GTK3 运行时
+```
+
+从不处理带内嵌 SVG 的 markdown/textpack 文档的部署，可以忽略这条启动警告。
 
 ## 关于LightRAG
 
@@ -485,6 +506,7 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 | 文档 | 内容 |
 |---|---|
 | [RoleSpecificLLMConfiguration-zh.md](./docs/RoleSpecificLLMConfiguration-zh.md) | 按角色（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）配置 LLM 与 VLM |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成参数完整参考（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`，英文） |
 | [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | 查询/文档非对称 embedding（`EMBEDDING_ASYMMETRIC`）与各模型的前缀 |
 | [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | 通过 `vector_db_storage_cls_kwargs` 调整 Milvus 索引参数 |
 
@@ -520,7 +542,7 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 
 列出争用同一个规范 source key 的文档，并把运维人员未选中的候选降级为重复项。工具本身从不自行裁定胜者，也从不删除内容。
 
-**`download_cache.py`** — `lightrag-download-cache [--spacy --spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
 
 预先下载离线部署及 docx `smart_heading` 引擎参数所需的 tiktoken 编码与钉版 spaCy 模型。
 

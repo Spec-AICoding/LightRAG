@@ -79,7 +79,9 @@ from lightrag import pipeline_metrics
 from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.base import ParseContext
-from lightrag.parser.llm_bridge import LLMBridgePipelineCancelled
+from lightrag.parser.exceptions import (
+    ParsePipelineCancelled,
+)
 from lightrag.parser.registry import (
     get_parser,
     parser_specs_snapshot,
@@ -111,7 +113,11 @@ from lightrag.utils import (
     save_to_cache,
     serialize_llm_cache_identity,
     strip_control_characters,
+    LLM_TRUNCATION_METADATA_KEY,
+    merge_truncation_metadata,
+    TokenLimitTruncationTally,
     tolerant_load_json_dict,
+    validate_file_path_security,
 )
 from lightrag.utils_pipeline import (
     # Re-exported through the pipeline namespace (not used by this module
@@ -305,6 +311,56 @@ def _vlm_image_budget_limits() -> tuple[int, int]:
     return max_image_bytes, min_image_pixel
 
 
+class _SidecarPathOutcome(str, Enum):
+    """Why :func:`_resolve_sidecar_image_path` did or did not return a file."""
+
+    RESOLVED = "resolved"  # a real file, contained to the sidecar dir
+    REFUSED = "refused"  # containment / malformed / non-string — never read
+    MISSING = "missing"  # contained but no such file on disk (or a dir)
+
+
+def _resolve_sidecar_image_path(
+    path_str: object, sidecar_dir: Path
+) -> tuple[Path | None, _SidecarPathOutcome]:
+    """Resolve a sidecar image reference, contained to ``sidecar_dir``.
+
+    The ``path`` field of ``<doc>.drawings.json`` is attacker-influenced data
+    at rest: a sidecar can be written by an older version, by an external
+    engine, or restored from a backup, and the value inside it originates in
+    an uploaded document. This resolver is the sink that turns it into a file
+    that gets read and sent to the VLM, so containment belongs here rather
+    than resting on every producer behaving (GHSA-8rgj-chc2-6chv).
+
+    A legitimate value is relative and names a file inside the document's own
+    ``<base>.blocks.assets/``. Anything that leaves ``sidecar_dir`` — an
+    absolute path, or ``../`` — resolves outside and is refused.
+
+    Returns ``(path, outcome)``. The outcome lets the caller tell a genuine
+    "no such file" (``MISSING``) apart from a containment/format refusal
+    (``REFUSED``): a legacy sidecar whose ``path`` is an absolute
+    RAG-Anything/MinerU value points at a file that DOES exist but sits
+    outside the document dir, so reporting it as "not found" would send an
+    operator debugging vanished VLM analysis away from the real cause.
+
+    Containment is delegated to :func:`validate_file_path_security`, the
+    shared ``resolve()`` + ``is_relative_to()`` primitive (it folds ``..``
+    away, resolves both sides so a symlinked prefix like macOS
+    ``/tmp`` → ``/private/tmp`` still matches, and converts any malformed
+    path — embedded NUL, symlink loop — into a quiet ``None`` rather than an
+    exception that would fail-fast the whole document). A non-string value is
+    refused explicitly here: the shared helper would swallow the resulting
+    ``TypeError`` via its blanket except, but the guard states the intent.
+    """
+    if not isinstance(path_str, str) or not path_str:
+        return None, _SidecarPathOutcome.REFUSED
+    safe = validate_file_path_security(path_str, sidecar_dir)
+    if safe is None:
+        return None, _SidecarPathOutcome.REFUSED
+    if safe.is_file():
+        return safe, _SidecarPathOutcome.RESOLVED
+    return None, _SidecarPathOutcome.MISSING
+
+
 @lru_cache(maxsize=64)
 def _warn_content_budget_structurally_starved(
     *,
@@ -396,6 +452,9 @@ _CHUNKING_METHOD_LABELS: dict[str, str] = {
     "V": "semantic_vector",
     "P": "paragraph_semantic",
 }
+
+_CUSTOM_CHUNKING_METHOD = "custom_chunking_func"
+_CUSTOM_CHUNKING_FALLBACK_METHOD = "custom_chunking_fallback_fixed_token"
 
 
 _CHUNK_LOG_KEY_ALIASES: dict[str, str] = {
@@ -639,7 +698,7 @@ class _PipelineMixin:
                 content-dedup happens after parsing). Ignored when ``ids``
                 is provided (see ``ids`` above).
             parse_engine: file extraction engine already used or target engine for pending_parse
-            process_options: per-document processing options string (i/t/e/!/F/R/V/P);
+            process_options: per-document processing options string (i/t/e/!/F/R/V/P/C);
                 accepted as a single string broadcast to every input or as a list
                 aligned with ``input``. Stored verbatim on ``full_docs`` and
                 mirrored to ``doc_status.metadata['process_options']``.
@@ -4438,11 +4497,11 @@ class _PipelineMixin:
                 # body from full_docs by doc_id.
                 parsed_data_w.pop("content", None)
                 await ctx.q_analyze.put((doc_id_w, status_doc_w, parsed_data_w))
-            except (PipelineCancelledException, LLMBridgePipelineCancelled):
+            except (PipelineCancelledException, ParsePipelineCancelled):
                 # Cancellation raised from inside the parse engine (future-
                 # proofing — engines do not generally call
                 # _raise_if_cancelled, but native smart-heading's bridge raises
-                # LLMBridgePipelineCancelled while waiting on the batch cancel
+                # ParsePipelineCancelled while waiting on the batch cancel
                 # event. Parser-executor shutdown is intentionally a distinct
                 # exception and remains a generic parse failure for audit.
                 await self._mark_doc_cancelled_in_stage(
@@ -4485,6 +4544,27 @@ class _PipelineMixin:
                     )
             finally:
                 in_q.task_done()
+
+    @staticmethod
+    def _analyze_truncation_metadata_extra(
+        parsed_data: Any,
+    ) -> dict[str, Any] | None:
+        """``metadata_extra`` for a FAILED write on the analyze stage.
+
+        ``analyze_multimodal`` hands its truncation record over on EVERY
+        exit via ``parsed_data["llm_truncation"]``. On the raising exits
+        (fail-fast sibling failure, mid-VLM cancellation) the document goes
+        FAILED right here in the analyze worker and never reaches the
+        process stage's terminal writes — so the FAILED transition itself
+        must stamp the record, or an accepted truncated analysis whose
+        partial result is already in the sidecar leaves no durable trace.
+        """
+        payload = (
+            parsed_data.get("llm_truncation") if isinstance(parsed_data, dict) else None
+        )
+        if not payload:
+            return None
+        return {LLM_TRUNCATION_METADATA_KEY: payload}
 
     async def _analyze_worker(self, ctx: _BatchRunContext) -> None:
         """Layer 2 worker: run multimodal analysis (VLM) and feed q_process.
@@ -4593,6 +4673,9 @@ class _PipelineMixin:
                     stage_label="analyze",
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    metadata_extra=self._analyze_truncation_metadata_extra(
+                        parsed_data_w
+                    ),
                 )
             except Exception as e:
                 # Mirror _parse_worker: failures here must transition the
@@ -4609,6 +4692,14 @@ class _PipelineMixin:
                         status_doc=status_doc_w,
                         file_path=getattr(status_doc_w, "file_path", "unknown_source"),
                         extra_fields={"error_msg": str(e)},
+                        # Accepted-but-truncated sibling analyses recorded
+                        # before the fail-fast raise: analyze_multimodal hands
+                        # them over on every exit, and only this transition
+                        # can make them durable — the doc never reaches the
+                        # process stage's terminal writes.
+                        metadata_extra=self._analyze_truncation_metadata_extra(
+                            parsed_data_w
+                        ),
                     )
                 except Exception as upsert_err:
                     # Mirror _parse_worker: log instead of swallowing so a
@@ -4689,6 +4780,27 @@ class _PipelineMixin:
         extraction_meta: dict[str, Any] = {}
         chunk_results: list = []
         doc_process_opts = parse_process_options("")
+        # Document-scoped truncation record, fed by both KG stages (extraction
+        # + gleaning in extract_entities, description summaries in
+        # merge_nodes_and_edges). Stamped into doc_status.metadata at the
+        # terminal transition, where it survives the bounded pipeline-status
+        # ring and reaches /documents and the WebUI.
+        truncation_tally = TokenLimitTruncationTally()
+        # Analyze-stage (multimodal VLM/EXTRACT) truncations arrive on the
+        # hand-off dict: an accepted-but-truncated analysis feeds a partial
+        # description into extraction below, so it belongs in the same
+        # document record. Merged at the terminal writes — the analyze stage
+        # cannot stamp doc_status itself, because the key is per-attempt (not
+        # carried over) and would be dropped at the PROCESSING transition.
+        analyze_truncation = parsed_data.get("llm_truncation")
+        if not isinstance(analyze_truncation, dict):
+            analyze_truncation = None
+
+        def truncation_metadata_extra() -> dict[str, Any]:
+            merged = merge_truncation_metadata(
+                analyze_truncation, truncation_tally.as_metadata()
+            )
+            return {LLM_TRUNCATION_METADATA_KEY: merged} if merged else {}
 
         def get_failed_chunk_snapshot() -> tuple[list[str], int]:
             if chunks:
@@ -4773,13 +4885,17 @@ class _PipelineMixin:
 
                 # Chunker dispatch is driven by whether ``process_options``
                 # explicitly named a chunking strategy:
-                #   - Explicit selector (F/R/V/P present in the raw
+                #   - Explicit built-in selector (F/R/V/P present in the raw
                 #     options string): dispatch to a chunker that
                 #     follows the standardized file-chunker contract
                 #     ``(tokenizer, content, chunk_token_size, *,
                 #     <strategy kwargs>)``, with kwargs supplied from
                 #     the per-doc ``chunk_options`` snapshot persisted
                 #     at enqueue time.
+                #   - Explicit C selector: invoke ``self.chunking_func`` with
+                #     the legacy six-argument contract. If the callback is the
+                #     unmodified default, warn and use the exact fixed-token
+                #     file chunker so persisted/background work stays viable.
                 #   - No selector supplied: honor the
                 #     externally-customizable ``self.chunking_func``
                 #     with its legacy 6-arg signature so existing
@@ -4813,6 +4929,22 @@ class _PipelineMixin:
                 # ``doc_status.metadata['chunk_opts']`` via ``extraction_meta``
                 # so admin/list APIs can see the actual chunker params used.
                 chunk_opts_str: str = ""
+                chunk_method: str = "fixed_token_fallback"
+                sidecar_backfill_eligible = False
+
+                from lightrag.chunker import chunking_by_token_size
+
+                is_builtin_chunker = self.chunking_func is chunking_by_token_size
+                if (
+                    doc_process_opts.chunking_explicit
+                    and doc_process_opts.chunking != "C"
+                    and not is_builtin_chunker
+                ):
+                    logger.warning(
+                        "Custom chunking_func bypassed: process_options "
+                        f"explicitly selects strategy {doc_process_opts.chunking} "
+                        f"for d-id: {doc_id}"
+                    )
 
                 if doc_process_opts.chunking_explicit:
                     from lightrag.chunker import (
@@ -4826,7 +4958,76 @@ class _PipelineMixin:
                     )
 
                     strategy = doc_process_opts.chunking
-                    if strategy == "P":
+                    if strategy == "C":
+                        # C makes the legacy extension point explicit while
+                        # preserving its six positional arguments verbatim.
+                        # Its snapshot is intentionally the fixed-token one.
+                        c_opts = dict(chunk_opts.get("fixed_token") or {})
+                        c_chunk_size = int(
+                            c_opts.get("chunk_token_size", resolved_chunk_size)
+                        )
+                        c_args = (
+                            self.tokenizer,
+                            content,
+                            c_opts.get("split_by_character"),
+                            c_opts.get("split_by_character_only", False),
+                            c_opts.get(
+                                "chunk_overlap_token_size",
+                                self.chunk_overlap_token_size,
+                            ),
+                            c_chunk_size,
+                        )
+                        chunk_opts_str = _format_chunking_params(
+                            c_chunk_size,
+                            {
+                                "split_by_character": c_args[2],
+                                "split_by_character_only": c_args[3],
+                                "overlap": c_args[4],
+                            },
+                        )
+
+                        if is_builtin_chunker:
+                            logger.warning(
+                                "Custom chunking_func unavailable for selector C; "
+                                "using fixed-token fallback "
+                                f"for d-id: {doc_id}"
+                            )
+                            logger.info(
+                                "Chunking C(fallback F): "
+                                f"{chunk_opts_str}, doc_id: {doc_id}"
+                            )
+                            chunking_result = await run_in_chunking_executor(
+                                chunking_by_fixed_token,
+                                self.tokenizer,
+                                content,
+                                c_chunk_size,
+                                _emit_source_span=True,
+                                split_by_character=c_args[2],
+                                split_by_character_only=c_args[3],
+                                chunk_overlap_token_size=c_args[4],
+                            )
+                            chunk_method = _CUSTOM_CHUNKING_FALLBACK_METHOD
+                            sidecar_backfill_eligible = True
+                        else:
+                            logger.info(
+                                f"Chunking C(custom): {chunk_opts_str}, doc_id: {doc_id}"
+                            )
+                            try:
+                                # Keep the documented extension point on the
+                                # event loop; synchronous factories may touch
+                                # the running loop, while async callbacks are
+                                # awaited immediately. CPU-bound callbacks own
+                                # any desired thread offload.
+                                chunking_result = self.chunking_func(*c_args)
+                                if inspect.isawaitable(chunking_result):
+                                    chunking_result = await chunking_result
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    "C custom chunking_func failed "
+                                    f"for d-id {doc_id}: {exc}"
+                                ) from exc
+                            chunk_method = _CUSTOM_CHUNKING_METHOD
+                    elif strategy == "P":
                         # P carries its own ``chunk_token_size`` (CHUNK_P_SIZE
                         # env or ``addon_params['chunker']['paragraph_semantic']``);
                         # pop it out of the kwargs so we don't pass it
@@ -4854,6 +5055,7 @@ class _PipelineMixin:
                             doc_id=doc_id,
                             **p_opts,
                         )
+                        chunk_method = _CHUNKING_METHOD_LABELS["P"]
                     elif strategy == "R":
                         # R carries its own optional ``chunk_token_size``
                         # override (CHUNK_R_SIZE env or
@@ -4900,6 +5102,8 @@ class _PipelineMixin:
                             r_chunk_size,
                             **r_opts,
                         )
+                        chunk_method = _CHUNKING_METHOD_LABELS["R"]
+                        sidecar_backfill_eligible = True
                     elif strategy == "V":
                         # V carries its own optional ``chunk_token_size``
                         # advisory ceiling override (CHUNK_V_SIZE env or
@@ -4926,6 +5130,8 @@ class _PipelineMixin:
                             embedding_func=self.embedding_func,
                             **v_opts,
                         )
+                        chunk_method = _CHUNKING_METHOD_LABELS["V"]
+                        sidecar_backfill_eligible = True
                     else:  # "F"
                         # F honors its own ``chunk_token_size`` override
                         # (``addon_params['chunker']['fixed_token']`` or a
@@ -4948,6 +5154,8 @@ class _PipelineMixin:
                             _emit_source_span=True,
                             **f_opts,
                         )
+                        chunk_method = _CHUNKING_METHOD_LABELS["F"]
+                        sidecar_backfill_eligible = True
                 else:
                     f_opts = chunk_opts.get("fixed_token") or {}
                     # Honor the F-strategy ``chunk_token_size`` override (from
@@ -4981,13 +5189,11 @@ class _PipelineMixin:
                     logger.info(
                         f"Chunking F(legacy): {chunk_opts_str}, doc_id: {doc_id}"
                     )
-                    from lightrag.chunker import chunking_by_token_size
 
                     # Only the unmodified default fixed-token chunker understands the
                     # private ``_emit_source_span`` kwarg; a user-supplied
                     # ``chunking_func`` must not receive it.
                     legacy_kwargs = {}
-                    is_builtin_chunker = self.chunking_func is chunking_by_token_size
                     if is_builtin_chunker:
                         legacy_kwargs["_emit_source_span"] = True
                     legacy_args = (
@@ -5021,6 +5227,8 @@ class _PipelineMixin:
                         chunking_result = self.chunking_func(
                             *legacy_args, **legacy_kwargs
                         )
+                    chunk_method = "legacy_chunking_func"
+                    sidecar_backfill_eligible = is_builtin_chunker
                 if inspect.isawaitable(chunking_result):
                     chunking_result = await chunking_result
 
@@ -5054,20 +5262,10 @@ class _PipelineMixin:
                     "parse_engine": resolve_doc_status_parse_engine(
                         persisted_format, persisted_engine
                     ),
-                    "chunk_method": (
-                        # Explicit selector in process_options: reflect
-                        # the dispatched strategy.  ``fixed_token_fallback``
-                        # is preserved as a defensive label in case a
-                        # future selector char slips past the validator.
-                        _CHUNKING_METHOD_LABELS.get(
-                            doc_process_opts.chunking, "fixed_token_fallback"
-                        )
-                        if doc_process_opts.chunking_explicit
-                        # No selector: chunking_func was invoked, which
-                        # defaults to chunking_by_token_size but may be
-                        # customized by the caller.
-                        else "legacy_chunking_func"
-                    ),
+                    # Set by the actual branch taken, not merely the persisted
+                    # selector. This distinguishes C custom success from its
+                    # fixed-token fallback after callback removal.
+                    "chunk_method": chunk_method,
                     # Mirrors the chunking start log line (params portion only,
                     # without the strategy prefix or file path) so admins can
                     # see the actual chunker params used.  Carried across
@@ -5143,29 +5341,17 @@ class _PipelineMixin:
                             f"{original_chunk_count} -> {len(chunking_result)}"
                         )
 
-                # Backfill block provenance for F/R/V chunks (P already carries
-                # sidecars; multimodal chunks too). Runs on the final, post-split
+                # Backfill block provenance for chunks produced by a built-in
+                # F/R/V path (including C's fixed-token fallback). P already
+                # carries sidecars; multimodal chunks do too. Runs on the final, post-split
                 # chunk list so each slice maps precisely to the block(s) its
                 # content covers. Raises ChunkBlockMatchError -> doc FAILED when a
                 # chunk cannot be located in blocks.jsonl.
                 #
-                # Gated to the built-in F/R/V strategies — or the legacy path only
-                # when ``chunking_func`` is still the unmodified default fixed-token
-                # chunker. A user-supplied ``chunking_func`` may emit summaries /
-                # rewritten text that cannot be located in blocks.jsonl, which would
-                # wrongly FAIL the document.
-                if doc_process_opts.chunking_explicit:
-                    sidecar_backfill_eligible = doc_process_opts.chunking in {
-                        "F",
-                        "R",
-                        "V",
-                    }
-                else:
-                    from lightrag.chunker import chunking_by_token_size
-
-                    sidecar_backfill_eligible = (
-                        self.chunking_func is chunking_by_token_size
-                    )
+                # Eligibility is set by the actual dispatch branch. A custom
+                # callback may emit summaries/rewritten text that cannot be
+                # located in blocks.jsonl and must never be backfilled merely
+                # because the persisted selector is C.
 
                 if blocks_path and sidecar_backfill_eligible:
                     from lightrag.sidecar import backfill_chunk_sidecars
@@ -5242,6 +5428,7 @@ class _PipelineMixin:
                             chunks,
                             ctx.pipeline_status,
                             ctx.pipeline_status_lock,
+                            truncation_tally=truncation_tally,
                         )
                     )
                     chunk_results = await entity_relation_task
@@ -5265,6 +5452,19 @@ class _PipelineMixin:
                     metadata_extra={
                         "process_start_time": process_start_time,
                         "process_end_time": int(time.time()),
+                        # Same payload the merge-stage failure below writes.
+                        # None of these keys is carried over, so omitting them
+                        # here DROPPED the parse_format / parse_engine /
+                        # chunk_method / mm_chunks fields that the PROCESSING
+                        # transition had just stamped: a document that failed
+                        # during extraction ended up describing itself less
+                        # than one that failed one stage later. Always bound —
+                        # initialised empty above the try, so a failure that
+                        # precedes chunking simply contributes nothing.
+                        **extraction_meta,
+                        # A run that truncated and then failed keeps the
+                        # evidence: truncation is often why it failed.
+                        **truncation_metadata_extra(),
                     },
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
@@ -5304,6 +5504,7 @@ class _PipelineMixin:
                             on_anchors_durable=partial(
                                 self._mark_graph_mutation_started, doc_id, status_doc
                             ),
+                            truncation_tally=truncation_tally,
                         )
 
                     # If another in-flight document already triggered an abort
@@ -5347,6 +5548,11 @@ class _PipelineMixin:
                             "process_start_time": process_start_time,
                             "process_end_time": process_end_time,
                             **extraction_meta,
+                            # Empty on a clean run, which is what CLEARS a
+                            # previous attempt's summary: the key is not in the
+                            # carry-over whitelist, so absence means "this
+                            # attempt did not truncate", never "unchanged".
+                            **truncation_metadata_extra(),
                         },
                         # A PROCESSED document has no purge in flight by
                         # definition, so retire any journal that a resume purge
@@ -5409,6 +5615,7 @@ class _PipelineMixin:
                             "process_start_time": process_start_time,
                             "process_end_time": int(time.time()),
                             **extraction_meta,
+                            **truncation_metadata_extra(),
                         },
                         pipeline_status=ctx.pipeline_status,
                         pipeline_status_lock=ctx.pipeline_status_lock,
@@ -5713,6 +5920,7 @@ class _PipelineMixin:
         ctx: "_BatchRunContext",
         pipeline_status: dict,
         pipeline_status_lock,
+        metadata_extra: dict[str, Any] | None = None,
     ) -> None:
         """Mark a queued document FAILED with a 'User cancelled' message.
 
@@ -5721,7 +5929,9 @@ class _PipelineMixin:
         :meth:`_finalize_doc_failure` carries for the PROCESS stage. Also
         flushes the LLM response cache so any cache_ids written by completed
         sibling tasks (e.g. successful multimodal items inside a doc that is
-        being cancelled) survive a server restart.
+        being cancelled) survive a server restart. ``metadata_extra`` rides
+        the FAILED write — the analyze worker uses it to keep an accepted
+        truncated sibling analysis visible on the cancelled document.
         """
         status_snapshot = pipeline_status.copy()
         error_msg = (
@@ -5744,6 +5954,7 @@ class _PipelineMixin:
                 status_doc=status_doc,
                 file_path=file_path,
                 extra_fields={"error_msg": error_msg},
+                metadata_extra=metadata_extra,
             )
         except Exception as exc:
             logger.error(f"Failed to mark cancelled doc {doc_id} as FAILED: {exc}")
@@ -6309,6 +6520,13 @@ class _PipelineMixin:
                     f"d-id: {doc_id}, file: {file_path}: {enrich_err}"
                 )
 
+        # Stage-scoped truncation tally, shared by every item task on this
+        # loop (record() is await-free). A token-limit-truncated analysis
+        # that still parses is ACCEPTED — the partial description feeds KG
+        # extraction — so the condition must reach the document's durable
+        # metadata, not just the server log. Created BEFORE the try so the
+        # every-exit hand-off in its finally can always read it.
+        mm_truncation_tally = TokenLimitTruncationTally()
         try:
             lines = block_file.read_text(encoding="utf-8").splitlines()
             if not lines:
@@ -6537,20 +6755,6 @@ class _PipelineMixin:
                 value = _normalize_text(surrounding.get(key))
                 return value or "n/a"
 
-            def _resolve_image_path(
-                path_str: str | None, sidecar_dir: Path
-            ) -> Path | None:
-                if not path_str:
-                    return None
-                candidate = Path(path_str)
-                if not candidate.is_absolute():
-                    sidecar_candidate = sidecar_dir / path_str
-                    if sidecar_candidate.exists() and sidecar_candidate.is_file():
-                        candidate = sidecar_candidate
-                if candidate.exists() and candidate.is_file():
-                    return candidate
-                return None
-
             def _failure_result(message: str) -> dict[str, Any]:
                 return {
                     "analyze_time": int(time.time()),
@@ -6565,13 +6769,47 @@ class _PipelineMixin:
                     "message": message,
                 }
 
+            def _record_mm_truncation(fresh: bool, result_text: str, subject: str):
+                """Record an accepted-but-truncated fresh analysis.
+
+                Independent of ``analysis_cache_enabled`` on purpose: with the
+                cache off, the old cache-skip branch never even inspected the
+                marker. Cache hits (``fresh=False``) cannot be truncated —
+                truncated responses are never persisted.
+                """
+                if fresh and is_truncated_response(result_text):
+                    logger.warning(
+                        f"[analyze_multimodal] {subject}: token-limit-truncated "
+                        "response accepted; analysis may be incomplete "
+                        "(never cached)"
+                    )
+                    mm_truncation_tally.record("multimodal", subject)
+                    return True
+                return False
+
             async def _analyze_drawing(
                 item_id: str, item: dict[str, Any], sidecar_dir: Path
             ) -> tuple[dict[str, Any], str | None]:
                 path_str = (
                     item.get("path") or item.get("img_path") or item.get("image_path")
                 )
-                candidate = _resolve_image_path(path_str, sidecar_dir)
+                candidate, outcome = _resolve_sidecar_image_path(path_str, sidecar_dir)
+                if outcome is _SidecarPathOutcome.REFUSED:
+                    # The reference resolves OUTSIDE the document dir (an
+                    # absolute legacy RAG-Anything/MinerU path, a ``..`` escape)
+                    # or is malformed. Distinct from "not found": the target may
+                    # well exist, so "not found" would misdirect an operator.
+                    logger.warning(
+                        f"Sidecar image reference refused for containment "
+                        f"(doc_id={doc_id}): {path_str!r}"
+                    )
+                    return (
+                        _skipped_result(
+                            f"image reference refused (outside document dir "
+                            f"or malformed): {path_str or 'n/a'}"
+                        ),
+                        None,
+                    )
                 if candidate is None:
                     return (
                         _skipped_result(f"image file not found: {path_str or 'n/a'}"),
@@ -6679,38 +6917,35 @@ class _PipelineMixin:
                     lambda parsed: _validate_drawing_analysis(item_id, parsed),
                 )
                 cache_id_to_attach: str | None = None
-                if fresh and analysis_cache_enabled:
-                    if is_truncated_response(result_text):
-                        # A token-limit-truncated VLM response that still
-                        # parsed must not be persisted: the cache would replay
-                        # the partial analysis on every later run, even once a
-                        # larger token budget would have completed it.
-                        logger.warning(
-                            f"[analyze_multimodal] drawings/{item_id}: skipping "
-                            "analysis cache write for token-limit-truncated "
-                            "VLM response"
-                        )
-                    else:
-                        audit_blob = image_audit_metadata(normalized_images)
-                        original_prompt = prompt + (
-                            f"\n<vlm_images>"
-                            f"{json.dumps(audit_blob, ensure_ascii=False)}"
-                            "</vlm_images>"
-                            if audit_blob
-                            else ""
-                        )
-                        await save_to_cache(
-                            self.llm_response_cache,
-                            CacheData(
-                                args_hash=args_hash,
-                                content=str(result_text),
-                                prompt=original_prompt,
-                                mode="default",
-                                cache_type="analysis",
-                                chunk_id=None,
-                            ),
-                        )
-                        cache_id_to_attach = cache_id
+                # A token-limit-truncated VLM response that still parsed is
+                # recorded for the document's metadata and must not be
+                # persisted: the cache would replay the partial analysis on
+                # every later run, even once a larger token budget would have
+                # completed it.
+                response_truncated = _record_mm_truncation(
+                    fresh, result_text, f"drawings/{item_id}"
+                )
+                if fresh and analysis_cache_enabled and not response_truncated:
+                    audit_blob = image_audit_metadata(normalized_images)
+                    original_prompt = prompt + (
+                        f"\n<vlm_images>"
+                        f"{json.dumps(audit_blob, ensure_ascii=False)}"
+                        "</vlm_images>"
+                        if audit_blob
+                        else ""
+                    )
+                    await save_to_cache(
+                        self.llm_response_cache,
+                        CacheData(
+                            args_hash=args_hash,
+                            content=str(result_text),
+                            prompt=original_prompt,
+                            mode="default",
+                            cache_type="analysis",
+                            chunk_id=None,
+                        ),
+                    )
+                    cache_id_to_attach = cache_id
                 elif not fresh:
                     # Cache hit: the entry exists, so attaching its id is
                     # safe (and necessary for document-delete cleanup).
@@ -6973,26 +7208,24 @@ class _PipelineMixin:
                 if kind == "equation":
                     result_obj["equation"] = analysis_fields["equation"]
                 cache_id_to_attach: str | None = None
-                if fresh and analysis_cache_enabled:
-                    if is_truncated_response(result_text):
-                        logger.warning(
-                            f"[analyze_multimodal] {kind}/{item_id}: skipping "
-                            "analysis cache write for token-limit-truncated "
-                            "EXTRACT response"
-                        )
-                    else:
-                        await save_to_cache(
-                            self.llm_response_cache,
-                            CacheData(
-                                args_hash=args_hash,
-                                content=str(result_text),
-                                prompt=prompt,
-                                mode="default",
-                                cache_type="analysis",
-                                chunk_id=None,
-                            ),
-                        )
-                        cache_id_to_attach = cache_id
+                # Same contract as the drawings branch: record the accepted
+                # truncation for document metadata, never persist it.
+                response_truncated = _record_mm_truncation(
+                    fresh, result_text, f"{kind}/{item_id}"
+                )
+                if fresh and analysis_cache_enabled and not response_truncated:
+                    await save_to_cache(
+                        self.llm_response_cache,
+                        CacheData(
+                            args_hash=args_hash,
+                            content=str(result_text),
+                            prompt=prompt,
+                            mode="default",
+                            cache_type="analysis",
+                            chunk_id=None,
+                        ),
+                    )
+                    cache_id_to_attach = cache_id
                 elif not fresh:
                     # Cache hit path (handle_cache already gated by flag):
                     # safe to surface the existing cache_id for cleanup.
@@ -7234,6 +7467,18 @@ class _PipelineMixin:
                 stage_label="multimodal analyze",
                 doc_id=doc_id,
             )
+            if mm_truncation_tally:
+                truncation_message = (
+                    f"Warning: token-limit truncation hit "
+                    f"{mm_truncation_tally.affected} multimodal analyses for "
+                    f"{file_path} ({mm_truncation_tally.events} responses); "
+                    f"descriptions may be incomplete"
+                )
+                logger.warning(truncation_message)
+                if pipeline_status is not None and pipeline_status_lock is not None:
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = truncation_message
+                        append_pipeline_history(pipeline_status, truncation_message)
             parsed_data["multimodal_processed"] = True
             logger.info(f"[analyze_multimodal] completed for d-id: {doc_id}")
         except PipelineCancelledException:
@@ -7245,6 +7490,21 @@ class _PipelineMixin:
             raise
         except Exception as e:
             logger.warning(f"[analyze_multimodal] failed for d-id: {doc_id}: {e}")
+        finally:
+            # Analyze→process hand-off of the truncation record, on EVERY
+            # exit — not just success. Ride the hand-off dict rather than
+            # doc_status: LLM_TRUNCATION_METADATA_KEY is per-attempt (not
+            # carried over), so a stamp written here would be dropped at the
+            # PROCESSING transition. Consumers: on success and on the
+            # soft-swallowed exits the process stage merges it into its own
+            # tally at the terminal write; when this call raises (a sibling
+            # item's fail-fast failure, mid-VLM cancellation), the analyze
+            # worker stamps it onto the FAILED row. A success-only hand-off
+            # lost an accepted truncated analysis on exactly those raising
+            # exits — the item's partial result was already written to the
+            # sidecar, but the document's metadata never learned of it.
+            if mm_truncation_tally:
+                parsed_data["llm_truncation"] = mm_truncation_tally.as_metadata()
         return parsed_data
 
     def _build_mm_chunks_from_sidecars(

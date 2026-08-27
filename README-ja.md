@@ -220,7 +220,7 @@ make env-security-check # 任意: 現在の .env のセキュリティリスク�
 Native docx パーサーのオプトイン式エンジンパラメータ `smart_heading` は、文分割 / NER のヒューリスティック判定に spaCy を使用します。spaCy ランタイムは `api` extra に含まれています — 追加で必要なのは、バージョン固定された 2 つの言語モデル（`zh_core_web_sm` / `en_core_web_sm` 3.8.0、PyPI 未公開の GitHub release wheel）のインストールだけです：
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 smart_heading はファイル / ルール単位（例：`LIGHTRAG_PARSER=docx:native(smart_heading=true)`）でも、`.env` でグローバルにも有効化できます：
@@ -232,6 +232,27 @@ DOCX_SMART_HEADING=true
 ```
 
 グローバルスイッチが有効な場合（または `LIGHTRAG_PARSER` ルールに `native(smart_heading=true)` が含まれる場合）、サーバーは起動時にモデルの存在を検証し、欠落していればインストール手順を示して即座に失敗します（fail-fast）。smart_heading を一切使わないデプロイメントにはモデルは不要です。Docker のメインイメージにはモデルが同梱されています（lite イメージには含まれません）。オフライン環境については[オフラインデプロイメントガイド](./docs/OfflineDeployment.md)を参照してください。
+
+### オプション：SVG ラスタライズ用の libcairo（native md/textpack）
+
+Native markdown/textpack パーサーは、埋め込まれた SVG 画像を `cairosvg` 経由で PNG にラスタライズします。`cairosvg` は cairo への cffi バインディングです：`pip install cairosvg`（`api` extra に含まれる）は常に成功しますが、実際にレンダリングが動作するのは、ネイティブの `libcairo` 共有ライブラリもホストに存在する場合に限られます — pip/uv はシステムライブラリをインストールできません。欠落している場合、ラスタライズは実行時に失敗し、該当の SVG はスキップされます（ドキュメントの他の部分には影響しません）。サーバーは起動時にこの機能を検証し、欠落していれば目立つ黄色の警告を表示するため、この問題がドキュメント処理時まで気づかれずに隠れてしまうことを防ぎます。
+
+各プラットフォーム向けのシステムパッケージをインストールしてください：
+
+```bash
+# Debian / Ubuntu（公式 Docker イメージには既に含まれています）
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS（Homebrew）
+brew install cairo
+
+# Windows：libcairo-2.dll を同梱する GTK3 ランタイムをインストールしてください
+```
+
+埋め込み SVG を含む markdown/textpack ドキュメントを処理しないデプロイメントでは、この起動時の警告は無視して構いません。
 
 ## LightRAG について
 
@@ -485,6 +506,7 @@ LightRAG は、農業、コンピュータサイエンス、法律、混合ド�
 | ドキュメント | 内容 |
 |---|---|
 | [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | ロール別（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）の LLM・VLM 設定 |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成オプションの完全リファレンス（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`、英語） |
 | [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | クエリ／文書の非対称 embedding（`EMBEDDING_ASYMMETRIC`）とモデルごとのプレフィックス |
 | [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | `vector_db_storage_cls_kwargs` を通じた Milvus インデックスパラメータのチューニング |
 
@@ -520,7 +542,7 @@ default モードのキャッシュ（抽出・要約・マルチモーダル解
 
 同一の正規 source key を主張するドキュメントを一覧表示し、運用者が選ばなかった候補を重複としてマークします。ツールが勝者を自動で決めることはなく、内容を削除することもありません。
 
-**`download_cache.py`** — `lightrag-download-cache [--spacy --spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
 
 オフラインデプロイおよび docx の `smart_heading` エンジンパラメータに必要な tiktoken エンコーディングとバージョン固定済み spaCy モデルを事前ダウンロードします。
 
