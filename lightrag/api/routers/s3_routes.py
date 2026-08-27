@@ -5,16 +5,23 @@ This module contains S3-compatible object storage routes for the LightRAG API.
 import os
 import asyncio
 import json
+import re
 import traceback
 from pathlib import Path
 from typing import Optional, Literal
 from uuid import uuid4
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from lightrag import LightRAG
-from lightrag.utils import logger, generate_track_id, validate_workspace
+from lightrag.utils import (
+    logger,
+    generate_track_id,
+    validate_workspace,
+    compute_mdhash_id,
+)
 from lightrag.api.utils_api import internal_server_error
 
 
@@ -144,6 +151,537 @@ def _resolve_s3_config(request: S3IngestRequest) -> tuple:
     return endpoint, access_key, secret_key, secure
 
 
+def _split_json_objects(file_path: Path) -> tuple[list[str], str]:
+    """Split a JSON file into per-object chunk texts.
+
+    A top-level JSON array yields one chunk per element; any other JSON
+    document yields a single chunk. Returns ``(chunk_texts, full_text)``.
+
+    Raises:
+        ValueError: when the file is not valid UTF-8 JSON.
+    """
+    full_text = file_path.read_text(encoding="utf-8")
+    data = json.loads(full_text)
+    if isinstance(data, list):
+        chunk_texts = [
+            json.dumps(item, ensure_ascii=False) for item in data if item is not None
+        ]
+    else:
+        chunk_texts = [full_text.strip()] if full_text.strip() else []
+    return chunk_texts, full_text
+
+
+async def _ingest_json_as_custom_chunks(
+    rag: LightRAG,
+    file_path: Path,
+    track_id: str,
+    file_type: Optional[str] = None,
+    max_retries: int = 6,
+    retry_delay: float = 5.0,
+) -> Optional[str]:
+    """Ingest a JSON file as one chunk per JSON object.
+
+    Uses the journaled ``rag.ainsert_custom_chunks`` entry point, so the
+    standard doc_status lifecycle, entity/relation extraction and graph
+    merge all run unchanged. Afterwards the durable records are patched to
+    carry the real file name / track_id / file_type (the custom-chunks entry
+    point writes a placeholder ``file_path``).
+
+    Returns:
+        The created ``doc_id``, or ``None`` when the file is not
+        JSON-ingestible — callers should fall back to the standard pipeline.
+    """
+    try:
+        chunk_texts, full_text = _split_json_objects(file_path)
+    except Exception as exc:
+        logger.warning(
+            "[S3 Ingestion] JSON split failed for %s (%s); falling back to "
+            "standard pipeline",
+            file_path.name,
+            exc,
+        )
+        return None
+
+    if not chunk_texts:
+        logger.warning(
+            "[S3 Ingestion] No JSON objects found in %s; falling back to "
+            "standard pipeline",
+            file_path.name,
+        )
+        return None
+
+    doc_id = compute_mdhash_id(full_text, prefix="doc-")
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            await rag.ainsert_custom_chunks(full_text, chunk_texts, doc_id=doc_id)
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            busy_markers = ("busy", "cannot run concurrently", "scan")
+            if not any(marker in str(exc).lower() for marker in busy_markers):
+                raise
+            if attempt < max_retries:
+                logger.info(
+                    "[S3 Ingestion] Pipeline busy, retrying custom-chunk "
+                    f"ingestion ({attempt}/{max_retries}) for {file_path.name}"
+                )
+                await asyncio.sleep(retry_delay)
+    if last_error is not None:
+        raise last_error
+
+    # ainsert_custom_chunks writes a placeholder file_path; patch the
+    # durable records so scan matching, document listing and per-doc graph
+    # lookups see the real file name.
+    try:
+        doc = await rag.doc_status.get_by_id(doc_id)
+        if doc is not None:
+            doc["file_path"] = file_path.name
+            doc["track_id"] = track_id
+            meta = dict(doc.get("metadata") or {})
+            if file_type:
+                meta["file_type"] = file_type
+            doc["metadata"] = meta
+            await rag.doc_status.upsert({doc_id: doc})
+
+            full_doc = await rag.full_docs.get_by_id(doc_id)
+            if isinstance(full_doc, dict):
+                full_doc["file_path"] = file_path.name
+                await rag.full_docs.upsert({doc_id: full_doc})
+
+            chunk_ids = [cid for cid in (doc.get("chunks_list") or []) if cid]
+            chunk_rows = await rag.text_chunks.get_by_ids(chunk_ids)
+            patch_rows = {}
+            for cid, row in zip(chunk_ids, chunk_rows):
+                if isinstance(row, dict):
+                    patch_rows[cid] = {**row, "file_path": file_path.name}
+            if patch_rows:
+                await rag.text_chunks.upsert(patch_rows)
+    except Exception as patch_exc:
+        logger.error(
+            f"[S3 Ingestion] Failed to patch document records for "
+            f"{file_path.name}: {patch_exc}"
+        )
+
+    biz_id_stats = {"pairs": 0, "entities_updated": 0}
+    semantic_identifier_stats = {"pairs": 0, "entities_updated": 0}
+    try:
+        biz_id_stats = await _inject_field_into_entities(
+            rag, doc_id, chunk_texts, "id", "biz_id"
+        )
+    except Exception as biz_exc:
+        logger.warning(
+            "[S3 Ingestion] biz_id injection failed for %s: %s",
+            file_path.name,
+            biz_exc,
+        )
+    try:
+        semantic_identifier_stats = await _inject_field_into_entities(
+            rag, doc_id, chunk_texts, "semantic_identifier", "semantic_identifier"
+        )
+    except Exception as sem_exc:
+        logger.warning(
+            "[S3 Ingestion] semantic_identifier injection failed for %s: %s",
+            file_path.name,
+            sem_exc,
+        )
+
+    connector_stats = {"pairs": 0, "entities_updated": 0}
+    connector_source = None
+    connector_name = None
+    cc_pair_id = _parse_cc_pair_id(file_path.name)
+    if cc_pair_id is not None:
+        connector_meta = _lookup_connector(cc_pair_id)
+        if connector_meta:
+            connector_source = connector_meta.get("source")
+            connector_name = connector_meta.get("name")
+            try:
+                connector_stats = await _inject_connector_into_entities(
+                    rag,
+                    doc_id,
+                    chunk_texts,
+                    connector_source,
+                    connector_name,
+                )
+            except Exception as conn_exc:
+                logger.warning(
+                    "[S3 Ingestion] Connector injection failed for %s: %s",
+                    file_path.name,
+                    conn_exc,
+                )
+    else:
+        logger.info(
+            "[S3 Ingestion] Skipping connector injection: %s is not an onyx "
+            "batch file (iab_<cc_pair_id>_<attempt>_<batch>.json)",
+            file_path.name,
+        )
+
+    acl_stats = {"pairs": 0, "entities_updated": 0}
+    try:
+        acl_stats = await _inject_acl_into_entities(rag, doc_id, chunk_texts)
+    except Exception as acl_exc:
+        logger.warning(
+            "[S3 Ingestion] ACL injection failed for %s: %s",
+            file_path.name,
+            acl_exc,
+        )
+
+    logger.info(
+        "[S3 Ingestion] JSON custom chunks: "
+        + json.dumps(
+            {
+                "file": file_path.name,
+                "doc_id": doc_id,
+                "object_count": len(chunk_texts),
+                "biz_id_pairs": biz_id_stats["pairs"],
+                "biz_id_entities_updated": biz_id_stats["entities_updated"],
+                "semantic_identifier_pairs": semantic_identifier_stats["pairs"],
+                "semantic_identifier_entities_updated": semantic_identifier_stats["entities_updated"],
+                "connector_source": connector_source,
+                "connector_name": connector_name,
+                "connector_pairs": connector_stats["pairs"],
+                "connector_entities_updated": connector_stats["entities_updated"],
+                "acl_pairs": acl_stats["pairs"],
+                "acl_entities_updated": acl_stats["entities_updated"],
+            },
+            ensure_ascii=False,
+        )
+    )
+    return doc_id
+
+
+def _inject_property_sync(
+    uri: str,
+    username: str,
+    password: str,
+    database: Optional[str],
+    escaped_label: str,
+    property_name: str,
+    pairs: list[dict],
+) -> int:
+    """Blocking Neo4j write: union-merge arrays on matched entities.
+
+    The ``property_name`` is interpolated into backticked identifiers only
+    after escaping, so the Cypher stays safe for the internal constants
+    used by callers (``biz_id``, ``semantic_identifier``).
+    """
+    from neo4j import GraphDatabase as Neo4jDriver
+
+    escaped_property = property_name.replace("`", "``")
+    query = f"""
+    UNWIND $pairs AS p
+    MATCH (n:`{escaped_label}`)
+    WHERE n.source_id CONTAINS p.chunk_id
+    WITH n, collect(DISTINCT p.value) AS new_ids
+    WITH n, reduce(acc = coalesce(n.`{escaped_property}`, []), x IN new_ids |
+        CASE WHEN x IN acc THEN acc ELSE acc + [x] END) AS merged
+    SET n.`{escaped_property}` = merged
+    RETURN count(n) AS updated
+    """
+
+    driver = Neo4jDriver.driver(uri, auth=(username, password))
+    try:
+        with driver.session(database=database) as session:
+            record = session.run(query, pairs=pairs).single()
+            return int(record["updated"]) if record else 0
+    finally:
+        driver.close()
+
+
+async def _inject_field_into_entities(
+    rag: LightRAG,
+    doc_id: str,
+    chunk_texts: list[str],
+    source_field: str,
+    property_name: str,
+) -> dict:
+    """Inject a JSON field into Neo4j entity properties as a list.
+
+    Entities are matched to chunks through the ``source_id`` property using
+    the same document-scoped chunk ids that ``ainsert_custom_chunks`` writes.
+    The value is stored as a list property: the existing array and this
+    document's values are unioned with deduplication, so values accumulate
+    across files — mirroring the ``source_id`` accumulation semantics.
+
+    Args:
+        rag: The LightRAG instance.
+        doc_id: The document id the chunks belong to.
+        chunk_texts: One JSON object string per chunk.
+        source_field: JSON field to read (e.g. ``"id"`` for ``biz_id``).
+        property_name: Neo4j property to write (e.g. ``"biz_id"``).
+
+    Returns:
+        dict: ``{"pairs": n, "entities_updated": m}``.
+    """
+    from lightrag.utils_pipeline import make_custom_chunk_id
+
+    pairs = []
+    for chunk_text in chunk_texts:
+        try:
+            obj = json.loads(chunk_text)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        value = obj.get(source_field)
+        if value is None or value == "":
+            continue
+        pairs.append(
+            {
+                "chunk_id": make_custom_chunk_id(doc_id, chunk_text),
+                "value": str(value),
+            }
+        )
+
+    if not pairs:
+        return {"pairs": 0, "entities_updated": 0}
+
+    uri, username, password, database, escaped_label = _neo4j_conn_params(rag)
+
+    updated = await asyncio.to_thread(
+        _inject_property_sync,
+        uri,
+        username,
+        password,
+        database,
+        escaped_label,
+        property_name,
+        pairs,
+    )
+    return {"pairs": len(pairs), "entities_updated": updated}
+
+
+def _neo4j_conn_params(rag: LightRAG) -> tuple:
+    """Resolve Neo4j connection parameters shared by all injection helpers."""
+    uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    username = os.environ.get("NEO4J_USERNAME", "neo4j")
+    password = os.environ.get("NEO4J_PASSWORD", "")
+    database = os.environ.get("NEO4J_DATABASE", "").strip() or None
+    label = (os.environ.get("NEO4J_WORKSPACE", "") or rag.workspace or "").strip()
+    label = label or "base"
+    escaped_label = label.replace("`", "``")
+    return uri, username, password, database, escaped_label
+
+
+# ── Connector / ACL enrichment (magicbox gateway) ─────────────────────────
+
+# Optional trailing dedup suffix: the downloader renames colliding files to
+# iab_<cc>_<attempt>_<batch>_<n>.json, which must still resolve the cc_pair_id.
+_IAB_FILENAME_RE = re.compile(r"^iab_(\d+)_\d+_\d+(?:_\d+)?\.json$")
+CONNECTOR_SOURCE_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+_CONNECTOR_GATEWAY_URL = os.environ.get(
+    "MAGICBOX_CONNECTOR_GATEWAY", "http://127.0.0.1:8090"
+).rstrip("/")
+
+_connector_cache: dict[int, Optional[dict]] = {}
+
+
+def _parse_cc_pair_id(filename: str) -> Optional[int]:
+    """Extract the cc_pair_id from onyx batch file names.
+
+    Batch files follow ``iab_{cc_pair_id}_{index_attempt_id}_{batch_num}.json``
+    (e.g. ``iab_4_467_1.json`` → 4). Returns ``None`` for any other name.
+    """
+    match = _IAB_FILENAME_RE.match(filename)
+    return int(match.group(1)) if match else None
+
+
+def _lookup_connector(cc_pair_id: int) -> Optional[dict]:
+    """Resolve connector metadata through the magicbox gateway (cached)."""
+    if cc_pair_id in _connector_cache:
+        return _connector_cache[cc_pair_id]
+    result: Optional[dict] = None
+    try:
+        response = httpx.get(
+            f"{_CONNECTOR_GATEWAY_URL}/connectors/{cc_pair_id}", timeout=3.0
+        )
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:
+        logger.warning(
+            "[S3 Ingestion] Connector gateway lookup failed for cc_pair_id=%s: %s",
+            cc_pair_id,
+            exc,
+        )
+    _connector_cache[cc_pair_id] = result
+    return result
+
+
+def _inject_connector_sync(
+    uri: str,
+    username: str,
+    password: str,
+    database: Optional[str],
+    escaped_label: str,
+    escaped_connector: str,
+    source: str,
+    connector_name: str,
+    chunk_ids: list[str],
+) -> int:
+    """Blocking Neo4j write: stamp matched entities with connector label + properties."""
+    from neo4j import GraphDatabase as Neo4jDriver
+
+    query = f"""
+    UNWIND $chunk_ids AS chunk_id
+    MATCH (n:`{escaped_label}`)
+    WHERE n.source_id CONTAINS chunk_id
+    SET n:`{escaped_connector}`,
+        n.connector_source = $source,
+        n.connector_name = $name
+    RETURN count(DISTINCT n) AS updated
+    """
+
+    driver = Neo4jDriver.driver(uri, auth=(username, password))
+    try:
+        with driver.session(database=database) as session:
+            record = session.run(
+                query,
+                chunk_ids=chunk_ids,
+                source=source,
+                name=connector_name,
+            ).single()
+            return int(record["updated"]) if record else 0
+    finally:
+        driver.close()
+
+
+def _inject_acl_sync(
+    uri: str,
+    username: str,
+    password: str,
+    database: Optional[str],
+    escaped_label: str,
+    pairs: list[dict],
+) -> int:
+    """Blocking Neo4j write: union-merge ACL fields onto matched entities."""
+    from neo4j import GraphDatabase as Neo4jDriver
+
+    query = f"""
+    UNWIND $pairs AS p
+    MATCH (n:`{escaped_label}`)
+    WHERE n.source_id CONTAINS p.chunk_id
+    WITH n, collect(p) AS rows
+    WITH n,
+         reduce(acc = false, r IN rows | acc OR coalesce(r.is_public, false)) AS any_public,
+         reduce(acc = [], r IN rows | acc + r.emails) AS all_emails,
+         reduce(acc = [], r IN rows | acc + r.group_ids) AS all_group_ids
+    WITH n,
+         any_public,
+         reduce(acc = coalesce(n.external_user_emails, []), x IN all_emails |
+             CASE WHEN x IN acc THEN acc ELSE acc + [x] END) AS merged_emails,
+         reduce(acc = coalesce(n.external_user_group_ids, []), x IN all_group_ids |
+             CASE WHEN x IN acc THEN acc ELSE acc + [x] END) AS merged_groups
+    SET n.is_public = coalesce(n.is_public, false) OR any_public,
+        n.external_user_emails = merged_emails,
+        n.external_user_group_ids = merged_groups
+    RETURN count(DISTINCT n) AS updated
+    """
+
+    driver = Neo4jDriver.driver(uri, auth=(username, password))
+    try:
+        with driver.session(database=database) as session:
+            record = session.run(query, pairs=pairs).single()
+            return int(record["updated"]) if record else 0
+    finally:
+        driver.close()
+
+
+async def _inject_connector_into_entities(
+    rag: LightRAG,
+    doc_id: str,
+    chunk_texts: list[str],
+    source: str,
+    connector_name: str,
+) -> dict:
+    """Stamp every entity of the document with the connector label and properties.
+
+    The source is applied as a native label only after charset validation
+    (labels cannot be parameterized in Cypher). Idempotent: re-running sets
+    the same label and properties.
+    """
+    if not source or not CONNECTOR_SOURCE_RE.match(source):
+        logger.warning(
+            "[S3 Ingestion] Skipping connector injection: invalid source %r", source
+        )
+        return {"pairs": 0, "entities_updated": 0}
+
+    from lightrag.utils_pipeline import make_custom_chunk_id
+
+    chunk_ids = [make_custom_chunk_id(doc_id, text) for text in chunk_texts]
+    uri, username, password, database, escaped_label = _neo4j_conn_params(rag)
+    escaped_connector = source.replace("`", "``")
+    updated = await asyncio.to_thread(
+        _inject_connector_sync,
+        uri,
+        username,
+        password,
+        database,
+        escaped_label,
+        escaped_connector,
+        source,
+        connector_name,
+        chunk_ids,
+    )
+    return {"pairs": len(chunk_ids), "entities_updated": updated}
+
+
+async def _inject_acl_into_entities(
+    rag: LightRAG,
+    doc_id: str,
+    chunk_texts: list[str],
+) -> dict:
+    """Inject ``external_access`` into entity properties with union semantics.
+
+    ``is_public`` accumulates with OR; email / group lists accumulate as
+    deduplicated unions, so entities shared across documents keep every
+    grant (see the change design for the shared-entity rationale).
+    """
+    from lightrag.utils_pipeline import make_custom_chunk_id
+
+    pairs = []
+    for chunk_text in chunk_texts:
+        try:
+            obj = json.loads(chunk_text)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        access = obj.get("external_access")
+        if not isinstance(access, dict):
+            continue
+        pairs.append(
+            {
+                "chunk_id": make_custom_chunk_id(doc_id, chunk_text),
+                "is_public": bool(access.get("is_public")),
+                "emails": [
+                    str(e) for e in (access.get("external_user_emails") or []) if e
+                ],
+                "group_ids": [
+                    str(g)
+                    for g in (access.get("external_user_group_ids") or [])
+                    if g
+                ],
+            }
+        )
+
+    if not pairs:
+        return {"pairs": 0, "entities_updated": 0}
+
+    uri, username, password, database, escaped_label = _neo4j_conn_params(rag)
+    updated = await asyncio.to_thread(
+        _inject_acl_sync,
+        uri,
+        username,
+        password,
+        database,
+        escaped_label,
+        pairs,
+    )
+    return {"pairs": len(pairs), "entities_updated": updated}
+
+
 def create_s3_routes(
     rag: LightRAG,
     api_key: Optional[str] = None,
@@ -161,7 +699,7 @@ def create_s3_routes(
     from lightrag.api.routers.document_routes import (
         _reserve_enqueue_slot,
         _release_enqueue_slot,
-        pipeline_index_files,
+        pipeline_index_file,
         InsertResponse,
         get_managed_background_tasks,
     )
@@ -346,32 +884,45 @@ def create_s3_routes(
                             continue
 
                     if downloaded_paths:
-                        await pipeline_index_files(
-                            rag, downloaded_paths, track_id
-                        )
+                        json_ingested = 0
+                        for dl_path in downloaded_paths:
+                            if dl_path.suffix.lower() == ".json":
+                                doc_id = await _ingest_json_as_custom_chunks(
+                                    rag,
+                                    dl_path,
+                                    track_id,
+                                    file_type=request.file_type,
+                                )
+                                if doc_id is not None:
+                                    json_ingested += 1
+                                    continue
+                            await pipeline_index_file(rag, dl_path, track_id)
                         logger.info(
                             f"[S3 Ingestion] Enqueued {len(downloaded_paths)} files "
                             f"from S3 for processing"
                         )
+                        if json_ingested:
+                            logger.info(
+                                f"[S3 Ingestion] {json_ingested} JSON file(s) "
+                                f"ingested as per-object custom chunks"
+                            )
 
                         # Store file_type in doc_status metadata if provided
                         if request.file_type:
                             for dl_path in downloaded_paths:
-                                doc = await rag.doc_status.get_doc_by_file_path(
-                                    str(dl_path.resolve())
+                                found = await rag.doc_status.get_doc_by_file_basename(
+                                    dl_path.name
                                 )
-                                if doc is None:
-                                    doc = await rag.doc_status.get_doc_by_file_path(
-                                        str(dl_path)
-                                    )
-                                if doc:
-                                    doc_id = doc.get("doc_id")
-                                    if doc_id:
-                                        existing_meta = doc.get("metadata") or {}
-                                        existing_meta["file_type"] = request.file_type
-                                        await rag.doc_status.upsert(
-                                            {doc_id: {"metadata": existing_meta}}
-                                        )
+                                if found is None:
+                                    continue
+                                if isinstance(found, tuple) and len(found) == 2:
+                                    doc_id, doc = found
+                                else:
+                                    continue
+                                existing_meta = dict(doc.get("metadata") or {})
+                                existing_meta["file_type"] = request.file_type
+                                doc["metadata"] = existing_meta
+                                await rag.doc_status.upsert({doc_id: doc})
                 except HTTPException:
                     raise
                 except Exception as exc:
