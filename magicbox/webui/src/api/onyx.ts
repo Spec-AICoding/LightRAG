@@ -9,7 +9,9 @@ import axios from 'axios'
 // in your reverse proxy, or set VITE_ONYX_GATEWAY_URL to the gateway origin.
 const onyxBaseUrl = import.meta.env.VITE_ONYX_GATEWAY_URL || '/onyx'
 
-const onyxClient = axios.create({
+// Shared so api/magicbox.ts can reach gateway endpoints (document list)
+// without duplicating the base-URL logic.
+export const onyxClient = axios.create({
   baseURL: onyxBaseUrl,
   headers: {
     'Content-Type': 'application/json'

@@ -1,5 +1,6 @@
 import axios from 'axios'
 import type { LightragGraphType } from './lightrag'
+import { onyxClient } from './onyx'
 
 // Types — mirror the magicbox backend response shapes
 // (magicbox/backend/app/routers/{entities,subgraph}.py).
@@ -37,7 +38,9 @@ export type SubgraphFilters = {
 export type SubgraphDocument = {
   biz_id: string
   name: string
-  entities: number
+  link?: string
+  kg_stage?: string
+  entities?: number
 }
 
 export type MagicboxHealthResponse = {
@@ -117,18 +120,23 @@ export const getSubgraph = async (
 }
 
 /**
- * List the documents (biz_id) of a connector source/instance, grouped by
- * the unique biz_id. Display name prefers semantic_identifier; same-name
- * documents with different biz_ids stay as separate rows.
+ * List the documents belonging to a connector instance.
+ *
+ * Served by the onyx gateway (8090) straight from the onyx config DB —
+ * the document↔connector-instance attribution lives in
+ * document_by_connector_credential_pair, which is authoritative. The old
+ * /subgraph/documents path inferred this from Neo4j entity biz_id arrays,
+ * which cross-contaminated when entities merged across connectors (e.g. a
+ * person entity contributed by both JIRA and Confluence docs).
  */
 export const getSubgraphDocuments = async (
   connector?: string,
   connectorName?: string
 ): Promise<{ documents: SubgraphDocument[] }> => {
-  const response = await magicboxClient.get('/subgraph/documents', {
+  const response = await onyxClient.get('/connectors/documents', {
     params: {
-      connector: connector ?? undefined,
-      connector_name: connectorName ?? undefined
+      name: connectorName ?? undefined,
+      source: connector ?? undefined
     }
   })
   return response.data

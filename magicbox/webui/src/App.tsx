@@ -18,6 +18,14 @@ import ApiSite from '@/features/ApiSite'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
+// Embedded mode (?embed=1&tab=knowledge-graph): the app runs inside the Onyx
+// host iframe and renders only the graph view — no site header, tab bar,
+// status indicator, or API-key alert (navigation and login belong to the
+// host). Standalone usage (no params) keeps the full Tabs layout unchanged.
+const isEmbedded =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('embed') === '1'
+
 function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
@@ -90,6 +98,30 @@ function App() {
       useBackendState.getState().clearHealthCheckTimer();
     };
   }, [enableHealthCheck, apiKeyAlertOpen]);
+
+  // Embedded deep-link: prefill the graph filter BEFORE the graph view
+  // mounts, so its first fetch already targets the requested subgraph (via
+  // the existing filter-change refetch in useLightragGraph) instead of
+  // issuing a pointless default /graphs request first. ?doc=<link> equals
+  // the magicbox biz_id; connector/connectorName prefill the cascading
+  // filter rows. Runs as its own effect (declared before the version check)
+  // because the version check can be skipped after the LoginPage's guest
+  // login (VERSION_CHECKED_FROM_LOGIN sessionStorage flag).
+  useEffect(() => {
+    if (!isEmbedded) return
+    const params = new URLSearchParams(window.location.search)
+    const doc = params.get('doc')
+    const connector = params.get('connector')
+    const connectorName = params.get('connectorName')
+    if (doc || connector || connectorName) {
+      useSettingsStore.getState().setGraphFilter({
+        bizId: doc ?? '',
+        connector: connector ?? '',
+        connectorName: connectorName ?? ''
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Version check - independent and executed only once
   useEffect(() => {
@@ -196,6 +228,11 @@ function App() {
               </div>
             </div>
           </div>
+        ) : isEmbedded ? (
+          // Embedded in Onyx: graph view only, filling the iframe.
+          <main className="flex h-screen w-screen overflow-hidden">
+            <GraphViewer />
+          </main>
         ) : (
           // Main content after initialization
           <main className="flex h-screen w-screen overflow-hidden">

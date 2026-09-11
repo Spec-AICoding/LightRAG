@@ -26,6 +26,7 @@ class Config:
     workspace: str
     port: int
     cors_origins: list[str]
+    acl_sync_enabled: bool
 
 
 def _load_env() -> None:
@@ -53,5 +54,8 @@ def get_config() -> Config:
                 ).split(",")
                 if origin.strip()
             ],
+            # Endpoint stays mounted either way; the switch gates writes.
+            acl_sync_enabled=os.getenv("ACL_SYNC_ENABLED", "true").lower()
+            == "true",
         )
     return _CONFIG

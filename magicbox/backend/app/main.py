@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_config
 from .neo4j import close_driver, escape_label, get_driver, get_session, verify_database
-from .routers import entities, subgraph
+from .routers import acl, entities, subgraph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("magicbox")
@@ -40,12 +40,13 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origins,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
     app.include_router(entities.router)
     app.include_router(subgraph.router)
+    app.include_router(acl.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict:

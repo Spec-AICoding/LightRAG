@@ -183,9 +183,9 @@ async def _ingest_json_as_custom_chunks(
 
     Uses the journaled ``rag.ainsert_custom_chunks`` entry point, so the
     standard doc_status lifecycle, entity/relation extraction and graph
-    merge all run unchanged. Afterwards the durable records are patched to
-    carry the real file name / track_id / file_type (the custom-chunks entry
-    point writes a placeholder ``file_path``).
+    merge all run unchanged with the real file name passed straight
+    through. Afterwards the durable records are patched to carry
+    track_id / file_type (and the file name is re-asserted, idempotent).
 
     Returns:
         The created ``doc_id``, or ``None`` when the file is not
@@ -214,7 +214,12 @@ async def _ingest_json_as_custom_chunks(
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            await rag.ainsert_custom_chunks(full_text, chunk_texts, doc_id=doc_id)
+            # Pass the real file name straight through so chunk rows, the
+            # extraction snapshot and graph entities carry it from birth
+            # (no unknown_source placeholder in Neo4j file_path).
+            await rag.ainsert_custom_chunks(
+                full_text, chunk_texts, doc_id=doc_id, file_path=file_path.name
+            )
             last_error = None
             break
         except Exception as exc:

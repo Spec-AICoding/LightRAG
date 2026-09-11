@@ -1856,9 +1856,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
     # TODO: deprecated, use ainsert instead
     async def ainsert_custom_chunks(
-        self, full_text: str, text_chunks: list[str], doc_id: str | None = None
+        self,
+        full_text: str,
+        text_chunks: list[str],
+        doc_id: str | None = None,
+        file_path: str | None = None,
     ) -> None:
         """Insert caller-chunked content as a journaled, recoverable operation.
+
+        ``file_path`` is stored verbatim as the document source (no
+        normalization): callers should pass the file name at ingestion time
+        so chunk rows, extraction snapshots and graph entities carry the
+        real source from birth instead of the ``unknown_source`` placeholder.
 
         Issue #3400 Phase 3 semantics — one invocation is one incremental
         operation with a durable journal in ``doc_status.metadata``:
@@ -1900,7 +1909,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # Clean input texts
             full_text = sanitize_text_for_encoding(full_text)
             text_chunks = [sanitize_text_for_encoding(chunk) for chunk in text_chunks]
-            file_path = normalize_document_file_path("")
+            # Caller-supplied file name used as-is (the s3 JSON branch passes
+            # Path.name); only fall back to the placeholder when absent.
+            file_path = file_path or "unknown_source"
 
             # Process cleaned texts
             if doc_id is None:

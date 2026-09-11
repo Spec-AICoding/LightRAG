@@ -26,8 +26,25 @@ declare global {
   }
 }
 
-const config =
-  (typeof window !== 'undefined' && window.__LIGHTRAG_CONFIG__) || {}
+const config = (() => {
+  const injected =
+    (typeof window !== 'undefined' && window.__LIGHTRAG_CONFIG__) || {}
+
+  // URL parameters take precedence over the injected config. This is how the
+  // embedded build works: when served from the Onyx host's static files there
+  // is no FastAPI injection, so the iframe URL carries apiPrefix (and
+  // optionally webuiPrefix) explicitly, e.g.
+  //   /lightrag-ui/?embed=1&tab=knowledge-graph&apiPrefix=/lightrag-api
+  const params =
+    typeof window !== 'undefined' && window.location?.search
+      ? new URLSearchParams(window.location.search)
+      : null
+
+  return {
+    apiPrefix: params?.get('apiPrefix') ?? injected.apiPrefix,
+    webuiPrefix: params?.get('webuiPrefix') ?? injected.webuiPrefix
+  }
+})()
 
 /** Browser-visible API prefix; empty string means same-origin / no prefix. */
 export function getRuntimeApiPrefix(): string | undefined {
