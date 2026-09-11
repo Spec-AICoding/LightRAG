@@ -765,12 +765,6 @@ class MongoDocStatusStorage(DocStatusStorage):
             counts[doc["_id"]] = doc["count"]
         return counts
 
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
-        return await self.get_docs_by_statuses([status])
-
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
@@ -2656,6 +2650,20 @@ class MongoGraphStorage(BaseGraphStorage):
             labels.append(doc["_id"])
         return labels
 
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        pipeline = [{"$project": {"_id": 1}}, {"$sort": {"_id": 1}}]
+        cursor = await self.collection.aggregate(pipeline, allowDiskUse=True)
+        batch: list[str] = []
+        async for doc in cursor:
+            batch.append(doc["_id"])
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     def _construct_graph_node(
         self, node_id, node_data: dict[str, str]
     ) -> KnowledgeGraphNode:
@@ -3323,6 +3331,22 @@ class MongoGraphStorage(BaseGraphStorage):
             edge_dict["target"] = edge_dict.get("target_node_id")
             edges.append(edge_dict)
         return edges
+
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        cursor = self.edge_collection.find({})
+        batch: list[dict] = []
+        async for edge in cursor:
+            item = dict(edge)
+            item["source"] = item.get("source_node_id")
+            item["target"] = item.get("target_node_id")
+            batch.append(item)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         """Get popular labels(entity names) by node degree (most connected entities)
@@ -4583,7 +4607,7 @@ class MongoVectorDBStorage(BaseVectorStorage):
         """Drop all documents and recreate the vector index. Destructive.
 
         MUST only be called when ``pipeline_status`` is idle (see the
-        Pipeline concurrency contract in ``AGENTS.md``); the only
+        Pipeline concurrency contract in ``docs/design/PipelineConcurrencyContract.md``); the only
         in-tree caller ``clear_documents`` enforces this.
 
         Caveat — only this instance's buffers are cleared. Other

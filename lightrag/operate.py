@@ -4,6 +4,7 @@ from functools import partial
 from pathlib import Path
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -32,6 +33,7 @@ from lightrag.utils import (
     atruncate_list_by_token_size,
     run_in_tokenizer_executor,
     compute_args_hash,
+    resolve_user_prompt,
     handle_cache,
     save_to_cache,
     CacheData,
@@ -144,7 +146,7 @@ class KGRebuildReport:
 
     Known degradation semantics: a degraded relationship preserves its stored
     ``weight`` as-is — without per-chunk extraction cache the rolled-back
-    chunk's weight contribution cannot be subtracted (#3399 precision is
+    chunk's weight contribution cannot be subtracted (precision is
     restored only by a full reprocess). The degradation is recorded in the
     persisted ``kg_recovery_warnings`` so operators can identify affected
     aggregates.
@@ -541,8 +543,9 @@ async def _summarize_descriptions(
     """Helper function to summarize a list of descriptions using LLM.
 
     Args:
-        entity_or_relation_name: Name of the entity or relation being summarized
-        descriptions: List of description strings to summarize
+        description_type: Type of the descriptions being summarized (entity or relation)
+        description_name: Name of the entity or relation being summarized
+        description_list: List of description strings to summarize
         global_config: Global configuration containing LLM function and settings
         llm_response_cache: Optional cache for LLM responses
         truncation_tally: Optional accumulator for token-limit truncation. A
@@ -907,6 +910,7 @@ async def _process_json_extraction_result(
     chunk_key: str,
     timestamp: int,
     file_path: str = "unknown_source",
+    parsed: dict[str, Any] | None = None,
 ) -> tuple[dict, dict]:
     """Process a JSON-formatted extraction result from LLM.
 
@@ -919,6 +923,13 @@ async def _process_json_extraction_result(
         chunk_key: The chunk key for source tracking
         timestamp: The timestamp for the extraction
         file_path: The file path for citation
+        parsed: Payload already recovered by :func:`tolerant_load_json_dict`,
+            for callers that need the parse outcome themselves rather than
+            only the extracted entities -- an empty result does not say
+            whether the payload was unrecoverable or merely carried nothing,
+            and cache rebuild has to tell those apart. ``None`` means "not
+            supplied" and is unambiguous: the helper always returns a dict,
+            so an unrecoverable payload still arrives here as ``{}``.
 
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
@@ -933,7 +944,8 @@ async def _process_json_extraction_result(
     # helper absorbs the underlying parse exception, only this single "empty or
     # unrecoverable" warning is logged — the low-level decode error is no longer
     # surfaced.
-    parsed = tolerant_load_json_dict(result)
+    if parsed is None:
+        parsed = tolerant_load_json_dict(result)
     if not parsed:
         logger.warning(
             f"{chunk_key}: JSON extraction result is empty or unrecoverable"
@@ -1501,6 +1513,7 @@ async def _process_extraction_result(
     file_path: str = "unknown_source",
     tuple_delimiter: str = "<|#|>",
     completion_delimiter: str = "<|COMPLETE|>",
+    warn_on_missing_completion_delimiter: bool = True,
 ) -> tuple[dict, dict]:
     """Process a single extraction result (either initial or gleaning)
     Args:
@@ -1509,6 +1522,11 @@ async def _process_extraction_result(
         file_path (str): The file path for citation
         tuple_delimiter (str): Delimiter for tuple fields
         completion_delimiter (str): Delimiter for completion
+        warn_on_missing_completion_delimiter (bool): Whether a missing
+            completion delimiter is worth a WARNING. Callers that already
+            reported the failure they are recovering from pass False so the
+            same failure is not announced twice; the missing delimiter is
+            still logged at DEBUG level for diagnosis.
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
     """
@@ -1516,10 +1534,14 @@ async def _process_extraction_result(
     maybe_edges = defaultdict(list)
 
     if completion_delimiter not in result:
-        logger.warning(
+        message = (
             f"{chunk_key}: Complete delimiter can not be found in extraction result"
             f"{_truncation_cause_suffix(result)}"
         )
+        if warn_on_missing_completion_delimiter:
+            logger.warning(message)
+        else:
+            logger.debug(message)
 
     # Split LLL output result to records by "\n"
     records = split_string_by_multi_markers(
@@ -1657,18 +1679,33 @@ async def _rebuild_from_extraction_result(
     )
 
     # Auto-detect format: try JSON first if the result looks like JSON
+    json_parse_reported_failure = False
     if _looks_like_json_extraction_result(extraction_result):
+        # Parse once here and hand the payload down. The parse outcome, not the
+        # emptiness of what was extracted from it, is what decides below whether
+        # the failure being recovered from was already reported -- the two are
+        # different things, and a payload carrying the wrong schema
+        # ({"answer": "none found"}) extracts nothing while parsing perfectly.
+        parsed = tolerant_load_json_dict(extraction_result)
         # Likely JSON format (from entity_extraction_use_json mode)
         nodes, edges = await _process_json_extraction_result(
             extraction_result,
             chunk_id,
             timestamp,
             file_path,
+            parsed=parsed,
         )
-        # If JSON parsing yielded results, use them
-        if nodes or edges:
+        # A successful parse (tolerant_load_json_dict's own non-empty-dict
+        # signal) is accepted even when it legitimately yields no nodes/edges.
+        if nodes or edges or parsed:
             return nodes, edges
-        # Otherwise fall through to text-based parsing
+        # Only an unrecoverable payload can reach here, and
+        # _process_json_extraction_result has already logged that failure. The
+        # delimiter parser below is a speculative rescue for a payload that
+        # merely looked like JSON, so its own "no completion delimiter"
+        # complaint would report that same single failure a second time; it is
+        # demoted to DEBUG for this call.
+        json_parse_reported_failure = True
 
     # Fall back to traditional delimiter-based parsing
     return await _process_extraction_result(
@@ -1678,6 +1715,7 @@ async def _rebuild_from_extraction_result(
         file_path,
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        warn_on_missing_completion_delimiter=not json_parse_reported_failure,
     )
 
 
@@ -2352,7 +2390,7 @@ def _combine_descriptions_dedup(
     Stored fragments come first (preserving prior order), then new fragments not
     already present. Deduplicating across stored *and* new (not only within the
     new batch) prevents a re-extracted description from appending a duplicate
-    fragment on every reprocess or resume (issue #3367); it also collapses any
+    fragment on every reprocess or resume; it also collapses any
     legacy duplicate fragments already stored. Returns the combined list and the
     count of surviving stored fragments, used for accurate merge accounting.
 
@@ -2520,7 +2558,8 @@ async def _merge_nodes_then_upsert(
         ):
             if already_node:
                 logger.info(
-                    f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
+                    f"Skipped `{entity_name}`: KEEP old chunks "
+                    f"{len(existing_full_source_ids)}/{len(full_source_ids)} (limit {max_source_limit})"
                 )
                 existing_node_data = dict(already_node)
                 return existing_node_data
@@ -2562,7 +2601,7 @@ async def _merge_nodes_then_upsert(
         sorted_descriptions = [dp["description"] for dp in sorted_nodes]
 
         # Combine stored and new descriptions, deduplicating across both so a
-        # re-extracted description does not accumulate on reprocess (issue #3367)
+        # re-extracted description does not accumulate on reprocess
         description_list, already_fragment = _combine_descriptions_dedup(
             already_description, sorted_descriptions
         )
@@ -2671,7 +2710,7 @@ async def _merge_nodes_then_upsert(
         deduplicated_num = already_fragment + len(nodes_data) - num_fragment
         dd_message = ""
         if deduplicated_num > 0:
-            # Duplicated description detected across multiple trucks for the same entity
+            # Duplicated description detected across multiple chunks for the same entity
             dd_message = f"dd {deduplicated_num}"
 
         if dd_message or truncation_info_log:
@@ -2679,7 +2718,7 @@ async def _merge_nodes_then_upsert(
                 f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
             )
 
-        # Add message to pipeline satus when merge happens
+        # Add message to pipeline status when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
             status_logger.log(status_message)
@@ -2899,7 +2938,8 @@ async def _merge_edges_then_upsert(
         ):
             if already_edge:
                 logger.info(
-                    f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
+                    f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks "
+                    f"{len(existing_full_source_ids)}/{len(full_source_ids)} (limit {max_source_limit})"
                 )
                 existing_edge_data = dict(already_edge)
                 return existing_edge_data
@@ -2920,7 +2960,7 @@ async def _merge_edges_then_upsert(
         # can be re-fed while it is already reflected in already_weights (the
         # stored scalar), so only sum weights of edges whose source_id is NOT
         # already stored -- otherwise weight double-counts and grows 1 -> 2 -> 3
-        # per reprocess (the #3367 sibling of description accumulation).
+        # per reprocess (the sibling of description accumulation).
         # Genuinely new sources still add their weight, preserving legitimate
         # multi-document growth.
         #
@@ -2997,7 +3037,7 @@ async def _merge_edges_then_upsert(
         sorted_descriptions = [dp["description"] for dp in sorted_edges]
 
         # Combine stored and new descriptions, deduplicating across both so a
-        # re-extracted description does not accumulate on reprocess (issue #3367)
+        # re-extracted description does not accumulate on reprocess
         description_list, already_fragment = _combine_descriptions_dedup(
             already_description, sorted_descriptions
         )
@@ -3101,7 +3141,7 @@ async def _merge_edges_then_upsert(
         deduplicated_num = already_fragment + len(edges_data) - num_fragment
         dd_message = ""
         if deduplicated_num > 0:
-            # Duplicated description detected across multiple trucks for the same entity
+            # Duplicated description detected across multiple chunks for the same entity
             dd_message = f"dd {deduplicated_num}"
 
         if dd_message or truncation_info_log:
@@ -3109,7 +3149,7 @@ async def _merge_edges_then_upsert(
                 f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
             )
 
-        # Add message to pipeline satus when merge happens
+        # Add message to pipeline status when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
             status_logger.log(status_message)
@@ -3440,7 +3480,7 @@ def collect_kg_merge_candidates(
 ) -> tuple[set[str], set[tuple[str, str]]]:
     """Derive the full candidate entity/relation superset a merge may touch.
 
-    Recovery anchor for issue #3400: before any graph/vector/tracking
+    Write-ahead recovery anchor: before any graph/vector/tracking
     mutation, the caller must be able to persist a durable candidate set in
     ``full_entities`` / ``full_relations`` so a later purge/retry can discover
     every object the merge might have written. The superset therefore
@@ -3496,7 +3536,7 @@ async def merge_nodes_and_edges(
 ) -> None:
     """Merge extracted entities/relations into the KG behind write-ahead anchors.
 
-    Phase order (issue #3400 — discoverability before mutation):
+    Phase order (discoverability before mutation):
     0. Phase 0: Persist the full candidate superset to ``full_entities`` /
        ``full_relations`` and flush both BEFORE any graph mutation, so a
        crash mid-merge always leaves a durable recovery anchor that purge /
@@ -3624,7 +3664,7 @@ async def merge_nodes_and_edges(
         pipeline_status["latest_message"] = log_message
         append_pipeline_history(pipeline_status, log_message)
 
-    # ===== Phase 0: write-ahead recovery indexes (issue #3400) =====
+    # ===== Phase 0: write-ahead recovery indexes =====
     # Persist the candidate superset BEFORE any graph/vector/tracking
     # mutation. Candidates are a superset, not proof of existence: purge
     # verifies ownership per candidate and skips absent objects. Empty rows
@@ -3761,7 +3801,7 @@ async def merge_nodes_and_edges(
 
         # Execute entity tasks; on any failure every sibling is cancelled and
         # drained before the first exception propagates (no background writes
-        # survive failure handling — issue #3400).
+        # survive failure handling).
         processed_entities = []
         if entity_tasks:
             processed_entities = await wait_tasks_with_drain(
@@ -3884,7 +3924,7 @@ async def merge_nodes_and_edges(
         # graph mutation. The historical post-merge "Phase 3" write — which
         # derived the rows from in-memory merge results and swallowed its own
         # exceptions — is gone: a merge whose anchors cannot be persisted no
-        # longer mutates the graph at all (issue #3400).
+        # longer mutates the graph at all.
 
     finally:
         # On EVERY exit — the inter-phase await points (sleep(0) yields,
@@ -3932,6 +3972,10 @@ async def extract_entities(
 
     # Extraction-scoped truncation tally; see _publish_truncation_summary below.
     stage_tally = TokenLimitTruncationTally()
+
+    # Optional per-chunk extraction-quality hook; None leaves the pipeline
+    # unchanged. See the call site in _process_single_content below.
+    kg_extraction_validator = global_config.get("kg_extraction_validator")
 
     use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -4004,6 +4048,41 @@ async def extract_entities(
             max_entity_records=max_entity_records,
         )
 
+    # The system prompt (and, in JSON mode, the continue prompt) is built
+    # solely from context_base, which is fixed for the whole extraction run.
+    # Format them once here instead of re-formatting per chunk, and reuse a
+    # precomputed token count for the same strings in the gleaning guard —
+    # the system prompt embeds the multi-thousand-token examples block. The
+    # encodes stay lazy behind the same condition that gates the gleaning
+    # guard, so runs with gleaning off never pay them.
+    gleaning_precheck = (
+        entity_extract_max_gleaning > 0
+        and extract_tokenizer is not None
+        and max_extract_input_tokens > 0
+    )
+    if use_json_extraction:
+        entity_extraction_system_prompt = PROMPTS[
+            "entity_extraction_json_system_prompt"
+        ].format(**context_base)
+        json_continue_extraction_user_prompt = PROMPTS[
+            "entity_continue_extraction_json_user_prompt"
+        ].format(**context_base)
+        gleaning_invariant_tokens = (
+            len(extract_tokenizer.encode(entity_extraction_system_prompt))
+            + len(extract_tokenizer.encode(json_continue_extraction_user_prompt))
+            if gleaning_precheck
+            else 0
+        )
+    else:
+        entity_extraction_system_prompt = PROMPTS[
+            "entity_extraction_system_prompt"
+        ].format(**context_base)
+        gleaning_invariant_tokens = (
+            len(extract_tokenizer.encode(entity_extraction_system_prompt))
+            if gleaning_precheck
+            else 0
+        )
+
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
 
@@ -4068,10 +4147,14 @@ async def extract_entities(
                 )
 
         if use_json_extraction:
-            # JSON mode: use JSON prompts and pass entity_extraction flag to LLM provider
-            entity_extraction_system_prompt = PROMPTS[
-                "entity_extraction_json_system_prompt"
-            ].format(**context_base)
+            # JSON mode: use JSON prompts and pass entity_extraction flag to LLM provider.
+            # The local must be bound explicitly: the text-mode branch below
+            # assigns this name, which makes it local to the whole closure
+            # (Python scoping is static), so the gleaning LLM call a few
+            # dozen lines down would otherwise read an unbound local here.
+            entity_continue_extraction_user_prompt = (
+                json_continue_extraction_user_prompt
+            )
             entity_extraction_user_prompt = PROMPTS[
                 "entity_extraction_json_user_prompt"
             ].format(
@@ -4081,14 +4164,13 @@ async def extract_entities(
                     "heading_context_block": heading_context_block,
                 }
             )
-            entity_continue_extraction_user_prompt = PROMPTS[
-                "entity_continue_extraction_json_user_prompt"
-            ].format(**context_base)
         else:
-            # Text mode: use traditional delimiter-based prompts
-            entity_extraction_system_prompt = PROMPTS[
-                "entity_extraction_system_prompt"
-            ].format(**context_base)
+            # Text mode: use traditional delimiter-based prompts. The
+            # chunk-invariant system prompt is built once in the enclosing
+            # scope. The continue prompt stays per chunk because a custom
+            # prompt file may reference {input_text}; the default template's
+            # placeholders do not include it, but the call site keeps passing
+            # the kwarg for that override case.
             entity_extraction_user_prompt = PROMPTS[
                 "entity_extraction_user_prompt"
             ].format(
@@ -4153,12 +4235,20 @@ async def extract_entities(
             # provider ``context_length_exceeded`` error.  Pre-check here
             # and skip rather than fail.
             gleaning_token_count = (
-                len(extract_tokenizer.encode(entity_extraction_system_prompt))
+                gleaning_invariant_tokens
                 + sum(
                     len(extract_tokenizer.encode(msg.get("content", "") or ""))
                     for msg in history
                 )
-                + len(extract_tokenizer.encode(entity_continue_extraction_user_prompt))
+                + (
+                    # Text mode only: the continue prompt embeds the chunk
+                    # content, so its token count is chunk-specific.
+                    len(
+                        extract_tokenizer.encode(entity_continue_extraction_user_prompt)
+                    )
+                    if not use_json_extraction
+                    else 0
+                )
             )
             if gleaning_token_count > max_extract_input_tokens:
                 logger.warning(
@@ -4243,9 +4333,81 @@ async def extract_entities(
                     maybe_edges[edge_key] = list(glean_edge_list)
                 await _cooperative_yield(i, every=8)
 
+        # Batch update chunk's llm_cache_list with all collected cache keys.
+        #
+        # Ordered BEFORE the validator on purpose. The rows are already
+        # written durably, but their keys live only in the in-memory
+        # cache_keys_collector until this call attaches them to the chunk, and
+        # recovery (_rollback_one_custom_chunk_patch) reaches cache rows
+        # exclusively through a chunk's llm_cache_list. A validator that raises
+        # exits the chunk here, so a key never attached is a row nothing can
+        # reach again — orphaned even after /documents/scan rolls the operation
+        # back. Ordering is all this buys, NOT durability: this call swallows
+        # storage errors, and a sibling cancelled by the FIRST_EXCEPTION path
+        # never reaches its own call. Both leave the same orphan; closing that
+        # off needs recovery to find rows by the `chunk_id` they already carry
+        # there, not more ordering here.
+        #
+        # Nothing after this point adds keys: the collector is filled by the
+        # extraction and gleaning calls above, and the multimodal injection
+        # below builds records from sidecar metadata without calling the LLM.
+        if cache_keys_collector and text_chunks_storage:
+            await update_chunk_cache_list(
+                chunk_key,
+                text_chunks_storage,
+                cache_keys_collector,
+                "entity_extraction",
+            )
+
+        # Optional extraction-quality hook: the last word on what the LLM
+        # extracted from this chunk. Caller-facing contract, including why core
+        # never prunes on the hook's behalf, is documented under "Extraction
+        # Quality Hook" in docs/ProgramingWithCore.md.
+        #
+        # Deliberately placed BEFORE the multimodal injection below. That entity
+        # is core-generated, not LLM output, and it is linked to every surviving
+        # entity of the chunk: filtering afterwards would both expose it to
+        # rules written for LLM output (a "name must appear in chunk_text"
+        # grounding check deletes it) and leave the injected
+        # (multimodal_entity, rejected_entity) edges dangling, so the merge's
+        # endpoint upsert would re-create the very entities the hook rejected.
+        if kg_extraction_validator is not None:
+            validated = kg_extraction_validator(
+                chunk_key,
+                # The EXTRACTION-VISIBLE text: `content` already has the
+                # parser-internal markup stripped, and this reproduces the
+                # sanitize_text_for_encoding that use_llm_func_with_cache
+                # applies to the whole prompt. The invariant is that the hook
+                # sees byte-for-byte what sat between the ---Input Text---
+                # fences of the prompt the provider received. strip=False
+                # follows from it: the chunk is a FRAGMENT sitting inside those
+                # fences, so its own boundary whitespace is interior to the
+                # prompt and stays model-visible, while the wrapper's strip only
+                # trims the template's ends.
+                sanitize_text_for_encoding(content, strip=False),
+                maybe_nodes,
+                maybe_edges,
+            )
+            if inspect.isawaitable(validated):
+                validated = await validated
+            # Validate the shape before unpacking: a bare unpack accepts a
+            # two-key dict and silently binds its KEYS as maybe_nodes /
+            # maybe_edges, surfacing much later inside the merge as an
+            # unrelated-looking failure.
+            if (
+                not isinstance(validated, (tuple, list))
+                or len(validated) != 2
+                or not all(isinstance(part, dict) for part in validated)
+            ):
+                raise TypeError(
+                    "kg_extraction_validator must return a (maybe_nodes, "
+                    "maybe_edges) pair of dicts; got "
+                    f"{type(validated).__name__} for chunk {chunk_key}"
+                )
+            maybe_nodes, maybe_edges = validated
+
         # Inject multimodal entity + associations for drawing/table/equation
-        # chunks. Placed before update_chunk_cache_list so the per-chunk
-        # cache write still happens after; placed inside the chunk's
+        # chunks. Placed inside the chunk's
         # concurrency slot (rather than the centralized post-pass that used
         # to live in utils_pipeline.augment_chunk_results_with_mm_entities)
         # so each multimodal chunk benefits from the chunk-level concurrency
@@ -4312,15 +4474,6 @@ async def extract_entities(
                             "timestamp": now_ts,
                         }
                     )
-
-        # Batch update chunk's llm_cache_list with all collected cache keys
-        if cache_keys_collector and text_chunks_storage:
-            await update_chunk_cache_list(
-                chunk_key,
-                text_chunks_storage,
-                cache_keys_collector,
-                "entity_extraction",
-            )
 
         processed_chunks += 1
         entities_count = len(maybe_nodes)
@@ -4545,7 +4698,7 @@ async def kg_query(
         Returns None when no relevant context could be constructed for the query.
     """
     if not query:
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=PROMPTS["fail_response"], llm_generated=False)
 
     # Apply higher priority (5) to query relation LLM function
     use_model_func = partial(
@@ -4572,7 +4725,7 @@ async def kg_query(
             logger.warning(f"Forced low_level_keywords to origin query: {query}")
             ll_keywords = [query]
         else:
-            return QueryResult(content=PROMPTS["fail_response"])
+            return QueryResult(content=PROMPTS["fail_response"], llm_generated=False)
 
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
     hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
@@ -4589,6 +4742,9 @@ async def kg_query(
         query_param,
         chunks_vdb,
         progress_callback=progress_callback,
+        # The token budget must be computed against the template this function
+        # will actually render below, not the default one.
+        system_prompt=system_prompt,
     )
 
     if context_result is None:
@@ -4598,10 +4754,16 @@ async def kg_query(
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(
-            content=context_result.context, raw_data=context_result.raw_data
+            content=context_result.context,
+            raw_data=context_result.raw_data,
+            llm_generated=False,
         )
 
-    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
+    effective_user_prompt = resolve_user_prompt(
+        query_param.user_prompt,
+        global_config.get("user_prompt_prefix", ""),
+        query_param.disable_user_prompt_prefix,
+    )
     response_type = (
         query_param.response_type
         if query_param.response_type
@@ -4612,7 +4774,7 @@ async def kg_query(
     sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
     sys_prompt = sys_prompt_temp.format(
         response_type=response_type,
-        user_prompt=user_prompt,
+        user_prompt=effective_user_prompt.slot,
         context_data=context_result.context,
     )
 
@@ -4620,7 +4782,11 @@ async def kg_query(
 
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
-        return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
+        return QueryResult(
+            content=prompt_content,
+            raw_data=context_result.raw_data,
+            llm_generated=False,
+        )
 
     # Call LLM
     tokenizer: Tokenizer = global_config["tokenizer"]
@@ -4650,9 +4816,18 @@ async def kg_query(
         query_param.max_total_tokens,
         hl_keywords_str,
         ll_keywords_str,
-        query_param.user_prompt or "",
+        # The COMPOSED instructions, so changing the server-side prefix
+        # invalidates entries generated under the old one. With no prefix
+        # configured this is byte-identical to the previous
+        # `query_param.user_prompt or ""`, so existing entries keep hitting --
+        # which is why _ANSWER_CACHE_POLICY_VERSION does not need a bump.
+        # `disable_user_prompt_prefix` is deliberately NOT a separate key
+        # component: it only ever acts through this value, and adding it would
+        # split the cache between two requests that build identical prompts.
+        effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
     )
@@ -4963,6 +5138,9 @@ async def extract_keywords_only(
                 "max_entity_tokens": param.max_entity_tokens,
                 "max_relation_tokens": param.max_relation_tokens,
                 "max_total_tokens": param.max_total_tokens,
+                # Metadata only. Keyword extraction has no {user_prompt} slot,
+                # so neither this nor the server-side prefix influences it, and
+                # neither belongs in the keyword cache key above.
                 "user_prompt": param.user_prompt or "",
                 "enable_rerank": param.enable_rerank,
             }
@@ -5593,6 +5771,7 @@ async def _build_context_str(
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
     progress_callback: ProgressCallback | None = None,
+    system_prompt: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the final LLM context string with token processing.
@@ -5620,13 +5799,29 @@ async def _build_context_str(
         global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
     )
 
-    # Get the system prompt template from PROMPTS or global_config
-    sys_prompt_template = global_config.get(
-        "system_prompt_template", PROMPTS["rag_response"]
+    # Budget against the template that will ACTUALLY be rendered. `kg_query`
+    # picks its template after this function returns, so without the forwarded
+    # `system_prompt` the estimate silently used the default one -- charging a
+    # caller's custom template at the wrong size, and charging the prefix even
+    # when that template has no {user_prompt} placeholder to render it into.
+    # `system_prompt_template` is kept as a lower-priority fallback: nothing in
+    # this repo writes it, but a downstream user may set it on their own config.
+    sys_prompt_template = (
+        system_prompt
+        or global_config.get("system_prompt_template")
+        or PROMPTS["rag_response"]
     )
 
     kg_context_template = PROMPTS["kg_query_context"]
-    user_prompt = query_param.user_prompt if query_param.user_prompt else ""
+    # `.text`, not `.slot`: this only sizes the token budget, and `.text`'s empty
+    # fallback matches what this line used before the prefix existed, so an
+    # unconfigured prefix changes no estimate. A configured one IS counted here,
+    # which is the point -- otherwise a long prefix would overfill the context.
+    effective_user_prompt = resolve_user_prompt(
+        query_param.user_prompt,
+        global_config.get("user_prompt_prefix", ""),
+        query_param.disable_user_prompt_prefix,
+    )
     response_type = (
         query_param.response_type
         if query_param.response_type
@@ -5650,10 +5845,16 @@ async def _build_context_str(
     kg_context_tokens = await acount_tokens(tokenizer, pre_kg_context)
 
     # Calculate preliminary system prompt tokens
+    # Charged even on the only_need_context path, which returns before this
+    # prompt is ever rendered. That is deliberate, not waste: only_need_context
+    # and only_need_prompt are debug switches whose job is to PREVIEW the real
+    # request. Skipping the charge here would make them report more chunks than
+    # a real query retrieves, so an operator would size their context against a
+    # number the live path never delivers.
     pre_sys_prompt = sys_prompt_template.format(
         context_data="",  # Empty for overhead calculation
         response_type=response_type,
-        user_prompt=user_prompt,
+        user_prompt=effective_user_prompt.text,
     )
     sys_prompt_tokens = await acount_tokens(tokenizer, pre_sys_prompt)
 
@@ -5772,6 +5973,7 @@ async def _build_query_context(
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
     progress_callback: ProgressCallback | None = None,
+    system_prompt: str | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -5846,6 +6048,7 @@ async def _build_query_context(
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
         progress_callback=progress_callback,
+        system_prompt=system_prompt,
     )
 
     # Convert keywords strings to lists and add complete metadata to raw_data
@@ -5936,7 +6139,7 @@ async def _get_node_data(
     )
 
     logger.info(
-        f"Local query: {len(node_datas)} entites, {len(use_relations)} relations"
+        f"Local query: {len(node_datas)} entities, {len(use_relations)} relations"
     )
 
     # Entities are sorted by cosine similarity
@@ -6212,7 +6415,7 @@ async def _get_edge_data(
     )
 
     logger.info(
-        f"Global query: {len(use_entities)} entites, {len(edge_datas)} relations"
+        f"Global query: {len(use_entities)} entities, {len(edge_datas)} relations"
     )
 
     return edge_datas, use_entities
@@ -6422,7 +6625,7 @@ async def _find_related_text_unit_from_relations(
         )
 
     logger.debug(
-        f"KG related chunks: {len(entity_chunks)} from entitys, {len(selected_chunk_ids)} from relations"
+        f"KG related chunks: {len(entity_chunks)} from entities, {len(selected_chunk_ids)} from relations"
     )
 
     if not selected_chunk_ids:
@@ -6512,7 +6715,7 @@ async def naive_query(
     """
 
     if not query:
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=PROMPTS["fail_response"], llm_generated=False)
 
     # Apply higher priority (5) to query relation LLM function
     use_model_func = partial(
@@ -6523,7 +6726,7 @@ async def naive_query(
     tokenizer: Tokenizer = global_config["tokenizer"]
     if not tokenizer:
         logger.error("Tokenizer not found in global configuration.")
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=PROMPTS["fail_response"], llm_generated=False)
 
     if progress_callback:
         await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
@@ -6547,7 +6750,11 @@ async def naive_query(
     )
 
     # Calculate system prompt template tokens (excluding content_data)
-    user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
+    effective_user_prompt = resolve_user_prompt(
+        query_param.user_prompt,
+        global_config.get("user_prompt_prefix", ""),
+        query_param.disable_user_prompt_prefix,
+    )
     response_type = (
         query_param.response_type
         if query_param.response_type
@@ -6559,10 +6766,13 @@ async def naive_query(
         system_prompt if system_prompt else PROMPTS["naive_rag_response"]
     )
 
-    # Create a preliminary system prompt with empty content_data to calculate overhead
+    # Create a preliminary system prompt with empty content_data to calculate overhead.
+    # As in _build_context_str, the user prompt is charged even when
+    # only_need_context will return before this prompt is sent: those switches
+    # preview the real request, so their chunk count must match it.
     pre_sys_prompt = sys_prompt_template.format(
         response_type=response_type,
-        user_prompt=user_prompt,
+        user_prompt=effective_user_prompt.slot,
         content_data="",  # Empty for overhead calculation
     )
 
@@ -6632,11 +6842,13 @@ async def naive_query(
     )
 
     if query_param.only_need_context and not query_param.only_need_prompt:
-        return QueryResult(content=context_content, raw_data=raw_data)
+        return QueryResult(
+            content=context_content, raw_data=raw_data, llm_generated=False
+        )
 
     sys_prompt = sys_prompt_template.format(
         response_type=query_param.response_type,
-        user_prompt=user_prompt,
+        user_prompt=effective_user_prompt.slot,
         content_data=context_content,
     )
 
@@ -6644,7 +6856,9 @@ async def naive_query(
 
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
-        return QueryResult(content=prompt_content, raw_data=raw_data)
+        return QueryResult(
+            content=prompt_content, raw_data=raw_data, llm_generated=False
+        )
 
     # Handle cache
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
@@ -6658,9 +6872,18 @@ async def naive_query(
         query_param.max_entity_tokens,
         query_param.max_relation_tokens,
         query_param.max_total_tokens,
-        query_param.user_prompt or "",
+        # The COMPOSED instructions, so changing the server-side prefix
+        # invalidates entries generated under the old one. With no prefix
+        # configured this is byte-identical to the previous
+        # `query_param.user_prompt or ""`, so existing entries keep hitting --
+        # which is why _ANSWER_CACHE_POLICY_VERSION does not need a bump.
+        # `disable_user_prompt_prefix` is deliberately NOT a separate key
+        # component: it only ever acts through this value, and adding it would
+        # split the cache between two requests that build identical prompts.
+        effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
     )

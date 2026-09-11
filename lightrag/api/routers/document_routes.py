@@ -22,6 +22,8 @@ from lightrag.utils import (
     performance_timing_log,
     safe_log_value,
     validate_workspace,
+    _consume_future_exception,
+    _wait_deferring_cancellation,
 )
 import aiofiles
 import traceback
@@ -63,7 +65,6 @@ from lightrag.base import (
     CURSOR_START,
     CursorAfter,
     CursorPosition,
-    DocProcessingStatus,
     DocStatus,
     SourceAbsent,
     SourceConflict,
@@ -1153,73 +1154,6 @@ class DocStatusResponse(BaseModel):
     )
 
 
-class DocsStatusesResponse(BaseModel):
-    """Response model for document statuses
-
-    Attributes:
-        statuses: Dictionary mapping document status to lists of document status responses
-    """
-
-    statuses: Dict[DocStatus, List[DocStatusResponse]] = Field(
-        default_factory=dict,
-        description="Dictionary mapping document status to lists of document status responses",
-    )
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "statuses": {
-                    "PENDING": [
-                        {
-                            "id": "doc_123",
-                            "content_summary": "Pending document",
-                            "content_length": 5000,
-                            "status": "pending",
-                            "created_at": "2025-03-31T10:00:00",
-                            "updated_at": "2025-03-31T10:00:00",
-                            "track_id": "upload_20250331_100000_abc123",
-                            "chunks_count": None,
-                            "error": None,
-                            "metadata": None,
-                            "file_path": "pending_doc.pdf",
-                        }
-                    ],
-                    "PREPROCESSED": [
-                        {
-                            "id": "doc_789",
-                            "content_summary": "Document pending final indexing",
-                            "content_length": 7200,
-                            "status": "preprocessed",
-                            "created_at": "2025-03-31T09:30:00",
-                            "updated_at": "2025-03-31T09:35:00",
-                            "track_id": "upload_20250331_093000_xyz789",
-                            "chunks_count": 10,
-                            "error": None,
-                            "metadata": None,
-                            "file_path": "preprocessed_doc.pdf",
-                        }
-                    ],
-                    "PROCESSED": [
-                        {
-                            "id": "doc_456",
-                            "content_summary": "Processed document",
-                            "content_length": 8000,
-                            "status": "processed",
-                            "created_at": "2025-03-31T09:00:00",
-                            "updated_at": "2025-03-31T09:05:00",
-                            "track_id": "insert_20250331_090000_def456",
-                            "chunks_count": 8,
-                            "error": None,
-                            "metadata": {"author": "John Doe"},
-                            "file_path": "processed_doc.pdf",
-                        }
-                    ],
-                }
-            }
-        }
-    )
-
-
 class TrackStatusResponse(BaseModel):
     """Response model for tracking document processing status by track_id
 
@@ -1873,17 +1807,42 @@ async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
     the namespace lock and raises immediately on contention -- it does
     NOT set any flag, so it cannot block the pipeline itself.
 
-    ``busy`` is set by the processing loop and by destructive jobs
-    (``/documents/clear`` / per-doc delete). Both paths concurrently
-    write the same graph storages that these endpoints mutate, so a
-    409 here mirrors the existing UI guard and tells clients to wait.
+    ``busy`` is set by the processing loop, by destructive jobs
+    (``/documents/clear`` / per-doc delete), AND by an admin graph write
+    itself. The first two concurrently write the same graph
+    storages that these endpoints mutate, so a 409 here mirrors the
+    existing UI guard and tells clients to wait.
 
-    A narrow race remains between this check and the underlying graph
-    write: if the pipeline transitions to busy in that window, the
-    per-edge/-node locks inside the storage layer are the last line of
-    defense. That trade-off is deliberate -- holding ``busy`` here
-    would serialise every UI edit against document ingestion, which is
-    a worse user-visible failure mode than tolerating the race.
+    **An ``admin`` holder is exempt, and the exemption is load-bearing.**
+    Refusing on the raw flag would refuse the second concurrent REST admin
+    write before it ever reaches the workspace admin lock, so the bounded
+    QUEUEING that lock provides would exist only for
+    direct SDK callers, and the client would be told to wait for document
+    ingestion when what is actually ahead of it is another UI edit. Letting
+    it through costs nothing: the core gate takes the admin lock, waits for
+    the peer edit, and only then takes the reservation -- and if a pipeline
+    job has claimed ``busy`` by that point, the gate refuses it there with
+    the same 409. ``None`` (a bare token, a legacy record, no owner) is NOT
+    exempt: an unidentifiable holder is what a fence exists for.
+
+    This check is a snapshot taken at request entry, while the graph
+    commit happens at request exit, so on its own it leaves the WHOLE
+    request open -- embedding round-trip included -- for the pipeline to
+    start inside; the per-edge/-node keyed locks do not close that, since
+    the pipeline and an admin write lock different keys. The window is
+    closed in the core instead: ``LightRAG._admin_write_gate``
+    takes the pipeline ``busy`` reservation (``kind="admin"``) for the
+    duration of every admin write, deferring a pipeline start until the
+    write commits, and refuses with its own 409 when the pipeline is
+    already busy or scanning. That gate runs only where the graph storage
+    declares ``requires_single_writer`` (``NetworkXStorage``, the one
+    backend whose reload discards uncommitted mutations); server-backed
+    graph stores never take it, so the cost once cited against holding
+    ``busy`` across a UI edit -- serialising every edit against ingestion --
+    does not apply to them, and on the file backend it amounts to deferring
+    a pipeline start by one short, LLM-free request. This router check is
+    kept as the early refusal that fails before any embedding work is
+    done; it is no longer the only guard.
 
     No-op (returns silently) when ``pipeline_status`` was never
     bootstrapped, matching the behaviour of ``_acquire_destructive_busy``
@@ -1895,6 +1854,7 @@ async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
         check_pipeline_status_mutation,
         get_namespace_data,
         get_namespace_lock,
+        reservation_owner_kind,
     )
 
     try:
@@ -1906,16 +1866,13 @@ async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
     pipeline_status_lock = get_namespace_lock(
         "pipeline_status", workspace=rag.workspace
     )
+    # ``reject_when=()``: the recovery fence is still evaluated (and is
+    # mandatory), but the ``busy`` decision needs the flag AND its owner, which
+    # the helper's flag-only form cannot express. Both come from the ONE
+    # snapshot the helper took inside ``pipeline_status_lock``, so this stays a
+    # single critical section rather than a second, racing read.
     result = await check_pipeline_status_mutation(
-        pipeline_status,
-        pipeline_status_lock,
-        reject_when=(
-            (
-                "busy",
-                "Pipeline is busy with another operation. Wait for the running "
-                "job to finish before editing the knowledge graph.",
-            ),
-        ),
+        pipeline_status, pipeline_status_lock, reject_when=()
     )
     if not result.acquired:
         raise HTTPException(
@@ -1925,6 +1882,17 @@ async def check_pipeline_busy_or_raise(rag: LightRAG) -> None:
                 else 409
             ),
             detail=result.message,
+        )
+    snapshot = result.snapshot or {}
+    if snapshot.get("busy") and (
+        reservation_owner_kind(snapshot.get("busy_owner")) != "admin"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Pipeline is busy with another operation. Wait for the running "
+                "job to finish before editing the knowledge graph."
+            ),
         )
 
 
@@ -3745,9 +3713,10 @@ async def run_scanning_process(
             pass
 
         # Roll back failed/stale custom-chunk operations FIRST, while the
-        # classification phase still holds ``scanning_exclusive`` (issue
-        # #3400 Phase 4). Discovery is storage-driven — SDK operations may
-        # have no scan-visible input file — and a failed rollback keeps the
+        # classification phase still holds ``scanning_exclusive`` (see
+        # docs/design/PurgeRecoveryContract.md for the rollback ordering).
+        # Discovery is storage-driven — SDK operations may have no
+        # scan-visible input file — and a failed rollback keeps the
         # journal/FAILED row for the next scan without aborting this one.
         if pipeline_status is not None and pipeline_status_lock is not None:
             try:
@@ -5817,13 +5786,32 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(
+        delete_parsed_files: Annotated[
+            bool,
+            Query(
+                description=(
+                    "Also delete the __parsed__ directory contents. Preserved "
+                    "by default so parsed artifacts survive re-adding the "
+                    "same files."
+                )
+            ),
+        ] = False,
+    ):
         """
         Clear all documents from the RAG system.
 
         This endpoint deletes all documents, entities, relationships, and files from the system.
         It uses the storage drop methods to properly clean up all data and removes all files
-        from the input directory.
+        from the input directory. The __parsed__ directory is preserved unless
+        delete_parsed_files=True is passed.
+
+        Top-level input files are always deleted unconditionally: a later
+        /documents/scan would otherwise re-enqueue them. The __parsed__
+        directory is opt-in only, since it holds pre-parsed cache artifacts
+        that let a re-added file skip re-parsing. A partial shutil.rmtree
+        failure (e.g. a locked file) can leave __parsed__ incomplete; re-run
+        with delete_parsed_files=True to retry.
 
         **Concurrency Constraint:**
         - Atomically reserves the destructive slot (sets ``busy=True``
@@ -6082,13 +6070,68 @@ def create_document_routes(
                     pipeline_status, f"Successfully deleted {deleted_files_count} files"
                 )
 
+            # __parsed__ is preserved by default so re-adding the same file
+            # does not require re-parsing, and so a deleted document's raw
+            # upload can still be recovered from there. Only remove it when
+            # the caller explicitly opts in.
+            parsed_dir_message = ""
+            parsed_dir = doc_manager.input_dir / PARSED_DIR_NAME
+            if delete_parsed_files:
+                if parsed_dir.exists():
+                    # __parsed__ can hold many files; run the recursive
+                    # delete off the event loop thread so a large directory
+                    # doesn't block every other request. A bare cancel (e.g.
+                    # the client disconnecting) would only cancel this
+                    # await -- the rmtree keeps running in the background --
+                    # while the `finally` below releases destructive_busy
+                    # immediately, letting a new request race an in-flight
+                    # delete. Defer the cancellation until rmtree actually
+                    # finishes, same idiom as milvus_impl.py's flush.
+                    rmtree_future = asyncio.ensure_future(
+                        asyncio.to_thread(shutil.rmtree, parsed_dir)
+                    )
+                    rmtree_future.add_done_callback(_consume_future_exception)
+                    pending_cancel = await _wait_deferring_cancellation(
+                        rmtree_future, None
+                    )
+                    if pending_cancel is not None and not rmtree_future.cancelled():
+                        rmtree_exc = rmtree_future.exception()
+                        if rmtree_exc is not None:
+                            logger.error(
+                                f"Error deleting {parsed_dir} while cancelled: "
+                                f"{rmtree_exc}"
+                            )
+                    elif pending_cancel is None:
+                        try:
+                            rmtree_future.result()
+                            parsed_dir_message = " Deleted __parsed__ directory."
+                            append_pipeline_history(
+                                pipeline_status, "Deleted __parsed__ directory"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error deleting {parsed_dir}: {str(e)}")
+                            errors.append(f"Failed to delete __parsed__ directory: {e}")
+                    if pending_cancel is not None:
+                        raise pending_cancel
+            elif parsed_dir.exists():
+                parsed_dir_message = (
+                    " __parsed__ preserved (pass delete_parsed_files=true to "
+                    "remove it)."
+                )
+
             # Prepare final result message
             final_message = ""
             if errors:
-                final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"Cleared documents with some errors. Deleted "
+                    f"{deleted_files_count} files.{parsed_dir_message}"
+                )
                 status = "partial_success"
             else:
-                final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
+                final_message = (
+                    f"All documents cleared successfully. Deleted "
+                    f"{deleted_files_count} files.{parsed_dir_message}"
+                )
                 status = "success"
 
             # Log final result
@@ -6239,110 +6282,6 @@ def create_document_routes(
             return PipelineStatusResponse(**status_dict)
         except Exception as e:
             logger.error(f"Error getting pipeline status: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise internal_server_error(e)
-
-    # TODO: Deprecated, use /documents/paginated instead
-    @router.get(
-        "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
-    )
-    async def documents() -> DocsStatusesResponse:
-        """
-        Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
-        To prevent excessive resource consumption, a maximum of 1,000 records is returned.
-
-        This endpoint retrieves the current status of all documents, grouped by their
-        processing status (PENDING, PROCESSING, PREPROCESSED, PROCESSED, FAILED). The results are
-        limited to 1000 total documents with fair distribution across all statuses.
-
-        Returns:
-            DocsStatusesResponse: A response object containing a dictionary where keys are
-                                DocStatus values and values are lists of DocStatusResponse
-                                objects representing documents in each status category.
-                                Maximum 1000 documents total will be returned.
-
-        Raises:
-            HTTPException: If an error occurs while retrieving document statuses (500).
-        """
-        try:
-            statuses = (
-                DocStatus.PENDING,
-                DocStatus.PARSING,
-                DocStatus.ANALYZING,
-                DocStatus.PROCESSING,
-                DocStatus.PREPROCESSED,
-                DocStatus.PROCESSED,
-                DocStatus.FAILED,
-            )
-
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
-            results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
-
-            response = DocsStatusesResponse()
-            total_documents = 0
-            max_documents = 1000
-
-            # Convert results to lists for easier processing
-            status_documents = []
-            for idx, result in enumerate(results):
-                status = statuses[idx]
-                docs_list = []
-                for doc_id, doc_status in result.items():
-                    docs_list.append((doc_id, doc_status))
-                status_documents.append((status, docs_list))
-
-            # Fair distribution: round-robin across statuses
-            status_indices = [0] * len(
-                status_documents
-            )  # Track current index for each status
-            current_status_idx = 0
-
-            while total_documents < max_documents:
-                # Check if we have any documents left to process
-                has_remaining = False
-                for status_idx, (status, docs_list) in enumerate(status_documents):
-                    if status_indices[status_idx] < len(docs_list):
-                        has_remaining = True
-                        break
-
-                if not has_remaining:
-                    break
-
-                # Try to get a document from the current status
-                status, docs_list = status_documents[current_status_idx]
-                current_index = status_indices[current_status_idx]
-
-                if current_index < len(docs_list):
-                    doc_id, doc_status = docs_list[current_index]
-
-                    if status not in response.statuses:
-                        response.statuses[status] = []
-
-                    response.statuses[status].append(
-                        DocStatusResponse(
-                            id=doc_id,
-                            content_summary=doc_status.content_summary,
-                            content_length=doc_status.content_length,
-                            status=doc_status.status,
-                            created_at=format_datetime(doc_status.created_at),
-                            updated_at=format_datetime(doc_status.updated_at),
-                            track_id=doc_status.track_id,
-                            chunks_count=doc_status.chunks_count,
-                            error_msg=doc_status.error_msg,
-                            metadata=doc_status.metadata,
-                            file_path=normalize_file_path(doc_status.file_path),
-                        )
-                    )
-
-                    status_indices[current_status_idx] += 1
-                    total_documents += 1
-
-                # Move to next status (round-robin)
-                current_status_idx = (current_status_idx + 1) % len(status_documents)
-
-            return response
-        except Exception as e:
-            logger.error(f"Error GET /documents: {str(e)}")
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
 
@@ -6996,7 +6935,7 @@ def create_document_routes(
         NOT repair anything; it only drops the fence (and any lingering
         reservation flags), re-opening a possibly-inconsistent workspace. Requires
         ``confirm=true``. A true idempotent replay of the interrupted operation is
-        a separate concern (core atomicity / #3400).
+        a separate concern (core atomicity).
 
         It ALSO cancels the workspace's queued manual retry requests, and that is
         load-bearing rather than housekeeping: a sticky un-ACKed request makes

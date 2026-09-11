@@ -317,10 +317,214 @@ async def _run_chunked_async_bulk(
     )
 
 
+# Painless script behind every KV upsert. It reproduces MongoDB's
+# ``$setOnInsert`` semantics for ``create_time`` ON THE SERVER, so a
+# replacement upsert never has to read the stored row back first (a
+# client-side read-modify-write cost one extra HTTP round trip per
+# ``upsert()`` call, and this backend is deliberately called with many small
+# batches):
+#   * document missing -> ``_KV_UPSERT_ACTION_UPSERT`` becomes the starting
+#     ``_source``, the sentinel is therefore present, and the ``create_time``
+#     carried in ``params.doc`` (the moment the write was buffered) stands;
+#   * document present  -> the business value is replaced wholesale and the
+#     STORED ``create_time`` is put back, or ``0`` when the row predates the
+#     field. A caller-supplied value can never win.
+# The sentinel decides "new", not ``ctx.op``, so the branch does not depend on
+# how the server happens to label a scripted upsert.
+# The restored value is also NORMALIZED to a long, mirroring
+# ``normalize_kv_create_time``: a row stored by an older release can carry a
+# float or a numeric string, and preserving that shape verbatim would leave
+# ``create_time`` mixed-typed across rows -- enough to make the LLM-cache
+# ordering in ``operate.py`` raise ``TypeError: '<' not supported between
+# instances of 'str' and 'int'``. Repairing it on the row's next write is the
+# same "fix the shape while you are here" rule the other backends follow.
+# ``tests/kg/opensearch_impl/test_opensearch_kv_create_time_integration.py``
+# pins the two normalizations to the same answers.
+_KV_CREATE_TIME_SENTINEL = "__lightrag_kv_new"
+_KV_UPSERT_SCRIPT_SOURCE = (
+    "def prev = ctx._source.create_time;"
+    f" boolean isNew = ctx._source.{_KV_CREATE_TIME_SENTINEL} == true;"
+    " ctx._source.clear();"
+    " ctx._source.putAll(params.doc);"
+    " if (!isNew) {"
+    "   long ct = 0;"
+    "   if (prev instanceof Number) { ct = ((Number) prev).longValue(); }"
+    "   else if (prev instanceof String) {"
+    "     try { ct = Long.parseLong(((String) prev).trim()); }"
+    "     catch (Exception e) { ct = 0; }"
+    "   }"
+    "   ctx._source.create_time = ct;"
+    " }"
+)
+_KV_UPSERT_ACTION_UPSERT = {_KV_CREATE_TIME_SENTINEL: True}
+# Concurrent updates of the same id are resolved by the server instead of
+# failing the bulk item with a 409 (which _extract_bulk_failed_ids would
+# classify as permanent).
+_KV_UPSERT_RETRY_ON_CONFLICT = 3
+
+
 # Index _meta flag marking that an edges index has been migrated to canonical
 # (sorted-pair) document ids. Guards the one-time reindex in
 # PGGraphStorage-style startup so it runs at most once per index.
 _EDGE_ID_CANONICAL_META_FLAG = "edge_id_canonical_v1"
+
+# Keys recorded in every index mapping's ``_meta`` naming the LightRAG
+# workspace and namespace the index belongs to, in their ORIGINAL form --
+# before the lowercase + character folding applied by
+# ``_sanitize_index_name``.
+#
+# That folding is not injective: ``TeamA`` and ``teama`` (both legal under the
+# workspace charset documented in env.example, and both preserved verbatim by
+# ``lightrag/api/config.py``) resolve to the same physical index, as do
+# ``v1.0`` and ``v1_0`` for direct library users. Two deployments that collide
+# this way share every index -- reading each other's documents, overwriting
+# each other's rows, and, because ``drop()`` deletes the whole physical index
+# on this backend, destroying each other's data on ``/documents/clear``.
+#
+# The marker turns that silent commingling into a startup failure. It is
+# deliberately a detection mechanism and not a renaming scheme: renaming the
+# index (e.g. by appending a hash of the workspace) would force a migration on
+# every existing deployment, including the overwhelming majority that never
+# collide.
+_WORKSPACE_META_KEY = "lightrag_workspace"
+_FINAL_NAMESPACE_META_KEY = "lightrag_final_namespace"
+# Both keys identify the owner: the joined ``{workspace}_{namespace}`` is
+# itself ambiguous (workspace ``foo`` + namespace ``text_chunks`` joins to the
+# same string as workspace ``foo_text`` + namespace ``chunks``, and both are
+# real LightRAG namespaces), so the workspace must be compared alongside it.
+_WORKSPACE_IDENTITY_KEYS = (_WORKSPACE_META_KEY, _FINAL_NAMESPACE_META_KEY)
+
+
+class WorkspaceIndexCollisionError(ValueError):
+    """An index is already claimed by a different LightRAG workspace.
+
+    Raised from index initialization, so a colliding deployment fails to start
+    (or fails its next write, when the index is being recreated after a drop)
+    instead of silently attaching to another workspace's data.
+    """
+
+
+def _workspace_index_meta(workspace: str, final_namespace: str) -> dict[str, str]:
+    """Build the ``_meta`` payload identifying an index's owning workspace."""
+    return {
+        _WORKSPACE_META_KEY: workspace,
+        _FINAL_NAMESPACE_META_KEY: final_namespace,
+    }
+
+
+def _stored_index_identity(meta: dict) -> dict[str, str | None]:
+    """Extract the owning-workspace identity recorded in an index ``_meta``."""
+    return {key: meta.get(key) for key in _WORKSPACE_IDENTITY_KEYS}
+
+
+def _describe_index_identity(identity: dict[str, str | None]) -> str:
+    """Render an index identity for an operator-facing message."""
+    return (
+        f"workspace '{identity.get(_WORKSPACE_META_KEY)}' / namespace "
+        f"'{identity.get(_FINAL_NAMESPACE_META_KEY)}'"
+    )
+
+
+def _workspace_collision_error(
+    index_name: str,
+    stored: dict[str, str | None],
+    expected: dict[str, str | None],
+) -> WorkspaceIndexCollisionError:
+    """Build the collision error, naming both sides and the way out."""
+    return WorkspaceIndexCollisionError(
+        f"OpenSearch index '{index_name}' belongs to "
+        f"{_describe_index_identity(stored)}, but this instance resolves to "
+        f"{_describe_index_identity(expected)}. Index names are lowercased, "
+        f"non-alphanumeric characters are folded to '_', and the workspace is "
+        f"joined to the namespace with '_', so these two configurations map to "
+        f"the same index and would share, overwrite and delete each other's "
+        f"data. Rename one of the workspaces (WORKSPACE / "
+        f"OPENSEARCH_WORKSPACE) so the two no longer fold together, or point "
+        f"this instance at a different OpenSearch cluster. Do NOT drop the "
+        f"index -- it holds the other workspace's data."
+    )
+
+
+async def _claim_index_for_workspace(
+    client,
+    index_name: str,
+    workspace: str,
+    final_namespace: str,
+) -> None:
+    """Verify (or record) that ``index_name`` belongs to this workspace.
+
+    Three outcomes:
+
+    * The stored marker matches -- the common path, nothing to do.
+    * The stored marker names a *different* owner -- raise
+      ``WorkspaceIndexCollisionError``. Never rewrite the marker: the index
+      holds another deployment's data. Both identity fields are compared,
+      because the joined ``{workspace}_{namespace}`` alone is ambiguous.
+    * No marker at all (an index created before this check existed) -- adopt
+      the index by writing the marker. ``_meta`` is replaced wholesale by
+      ``put_mapping``, so the existing ``_meta`` is merged rather than
+      overwritten, keeping flags such as ``_EDGE_ID_CANONICAL_META_FLAG``.
+
+    **Adopting a legacy index is not atomic across deployments.** Creating an
+    index is: only one caller wins ``indices.create``, and the loser reads the
+    winner's marker. But an already-existing unmarked index offers no
+    cluster-side compare-and-set, so two colliding deployments upgrading at the
+    same moment can both read "no marker" and both claim it. The confirmation
+    read below narrows that window -- it catches the other deployment writing
+    before we re-read -- but does not close it: a write landing after our
+    re-read leaves both deployments running for that session, which is exactly
+    where an unmarked index already was, and the mismatch surfaces on the next
+    attach. Two processes of the *same* workspace racing here write the same
+    value, which is idempotent and must never be reported as a collision; the
+    confirmation therefore compares the identity itself and never a
+    per-process token.
+    """
+    expected = _workspace_index_meta(workspace, final_namespace)
+    mapping = await client.indices.get_mapping(index=index_name)
+    meta = (mapping.get(index_name) or {}).get("mappings", {}).get("_meta") or {}
+    stored = _stored_index_identity(meta)
+    if stored == expected:
+        return
+    if any(value is not None for value in stored.values()):
+        # A partially written marker counts as claimed: an identity we cannot
+        # fully match is not ours to overwrite.
+        raise _workspace_collision_error(index_name, stored, expected)
+
+    try:
+        await client.indices.put_mapping(
+            index=index_name,
+            body={"_meta": {**meta, **expected}},
+        )
+    except OpenSearchException as e:
+        # Adopting a legacy index is the only part of this check that needs
+        # write access to the mapping. A read-only account, a restored
+        # snapshot or ``index.blocks.write`` must not turn a zero-migration
+        # safeguard into a startup failure: the index simply stays unmarked
+        # and unprotected, which is exactly where it was before this check
+        # existed. Detecting a marker that names a *different* workspace needs
+        # no write and still fails fast.
+        logger.warning(
+            f"[{workspace}] Could not record the workspace marker on index "
+            f"'{index_name}' ({e}); it stays unmarked, so a workspace whose "
+            f"name folds onto the same index cannot be detected"
+        )
+        return
+    logger.info(
+        f"[{workspace}] Claimed pre-existing index '{index_name}' for workspace "
+        f"namespace '{final_namespace}'"
+    )
+
+    confirmation = await client.indices.get_mapping(index=index_name)
+    confirmed = _stored_index_identity(
+        (confirmation.get(index_name) or {}).get("mappings", {}).get("_meta") or {}
+    )
+    # An entirely absent marker on re-read means the write has not become
+    # visible yet, not that another workspace owns the index -- only a
+    # *differing* identity is evidence of a collision.
+    if confirmed == expected or all(value is None for value in confirmed.values()):
+        return
+    raise _workspace_collision_error(index_name, confirmed, expected)
+
 
 # Emit a migration progress line every this many scanned edges, so operators
 # watching a large-index reindex see liveness and an X/total denominator.
@@ -713,8 +917,8 @@ class OpenSearchKVStorage(BaseKVStorage):
         # Pending writes are flushed via _flush_pending_kv_ops() during
         # index_done_callback() / finalize(). Buffering many small upsert()
         # invocations into a single async_bulk roundtrip avoids the per-call
-        # HTTP overhead profiled in issue #2785; the lock-everywhere model
-        # mirrors what #3043 introduced for OpenSearchVectorDBStorage.
+        # HTTP overhead profiled for the deferred-embedding work; the lock-everywhere model
+        # mirrors what was introduced for OpenSearchVectorDBStorage.
         self._pending_upserts: dict[str, dict[str, Any]] = {}
         self._pending_kv_deletes: set[str] = set()
         # Namespace-keyed lock (multi-process aware) is assigned in
@@ -765,6 +969,9 @@ class OpenSearchKVStorage(BaseKVStorage):
                 body = {
                     "mappings": {
                         "dynamic": True,
+                        "_meta": _workspace_index_meta(
+                            self.workspace, self.final_namespace
+                        ),
                         "properties": {
                             "__mirrored_id": {"type": "keyword"},
                         },
@@ -779,6 +986,16 @@ class OpenSearchKVStorage(BaseKVStorage):
                 await self.client.indices.create(index=self._index_name, body=body)
                 logger.info(f"[{self.workspace}] Created index: {self._index_name}")
             else:
+                # Ownership before any mapping mutation: never touch an index
+                # that turns out to belong to a different workspace. The
+                # trailing claim below still covers the freshly-created and
+                # lost-the-create-race paths.
+                await _claim_index_for_workspace(
+                    self.client,
+                    self._index_name,
+                    self.workspace,
+                    self.final_namespace,
+                )
                 await _verify_mirrored_id_mapping(self.client, self._index_name)
         except RequestError as e:
             if "resource_already_exists_exception" not in str(e):
@@ -786,6 +1003,14 @@ class OpenSearchKVStorage(BaseKVStorage):
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error creating index: {e}")
             raise
+
+        # Verify the index we just created (or attached to) is ours. The
+        # workspace-to-index-name mapping is lossy, so a differently-named
+        # workspace can resolve to this same index -- fail fast instead of
+        # silently sharing its data.
+        await _claim_index_for_workspace(
+            self.client, self._index_name, self.workspace, self.final_namespace
+        )
 
     async def finalize(self):
         """Flush pending writes and release the OpenSearch client connection.
@@ -1121,6 +1346,12 @@ class OpenSearchKVStorage(BaseKVStorage):
         call is deferred to ``_flush_pending_kv_ops()`` invoked from
         ``index_done_callback`` / ``finalize``.
 
+        No IO happens here. ``create_time`` preservation (the
+        ``BaseKVStorage.upsert`` contract) is delegated to the flush's
+        ``scripted_upsert`` action, so this method never reads the stored row
+        back; the ``create_time`` it buffers is an optimistic estimate that
+        the server overwrites for an already-existing row.
+
         Multi-worker note: the buffer is process-local. Other workers will
         not see these writes until ``index_done_callback()`` flushes them.
         """
@@ -1137,7 +1368,20 @@ class OpenSearchKVStorage(BaseKVStorage):
         prepared: list[tuple[str, dict[str, Any]]] = []
         for i, (doc_id, doc_data) in enumerate(data.items(), start=1):
             doc_data["update_time"] = current_time
-            doc_data.setdefault("create_time", current_time)
+            # An OPTIMISTIC create_time: right for an insert, and overwritten
+            # by the flush script with the stored value when the row already
+            # exists (see _KV_UPSERT_SCRIPT_SOURCE). Resolving it here would
+            # cost a read per upsert() call, so the buffered value is an
+            # estimate and the persisted one is authoritative. A caller-
+            # supplied create_time is overwritten either way, as the
+            # BaseKVStorage.upsert contract requires.
+            #
+            # Residue: a read served from the buffer (get_by_id / get_by_ids)
+            # reports this estimate, so an update of a row that already exists
+            # on the server shows the write time until the next flush, when the
+            # stored value wins. Same shape as before the read-modify-write fix; it
+            # heals at flush and never reaches storage.
+            doc_data["create_time"] = current_time
             source = {k: v for k, v in doc_data.items() if k != "_id"}
             source["__mirrored_id"] = doc_id
             prepared.append((doc_id, source))
@@ -1175,6 +1419,13 @@ class OpenSearchKVStorage(BaseKVStorage):
 
     async def _flush_pending_kv_ops(self) -> None:
         """Flush buffered upserts + deletes via a single async_bulk call.
+
+        Upserts are ``scripted_upsert`` update actions, not index actions: the
+        script preserves the stored ``create_time`` while replacing the
+        business value, which is how this backend meets the
+        ``BaseKVStorage.upsert`` contract without reading rows back
+        client-side. ``retry_on_conflict`` lets the server
+        resolve concurrent updates of one id instead of failing the item.
 
         Concurrency contract: the entire flush runs under ``_flush_lock``;
         ``upsert`` / ``delete`` / reads / ``drop`` all acquire the same lock
@@ -1214,12 +1465,22 @@ class OpenSearchKVStorage(BaseKVStorage):
                 }
                 for doc_id in pending_deletes
             ]
+            # A scripted upsert rather than a plain index: the script keeps the
+            # stored create_time while replacing the business value, which is
+            # what lets upsert() stay read-free. See _KV_UPSERT_SCRIPT_SOURCE.
             index_actions: list[dict[str, Any]] = [
                 {
-                    "_op_type": "index",
+                    "_op_type": "update",
                     "_index": self._index_name,
                     "_id": doc_id,
-                    "_source": source,
+                    "retry_on_conflict": _KV_UPSERT_RETRY_ON_CONFLICT,
+                    "scripted_upsert": True,
+                    "upsert": dict(_KV_UPSERT_ACTION_UPSERT),
+                    "script": {
+                        "lang": "painless",
+                        "source": _KV_UPSERT_SCRIPT_SOURCE,
+                        "params": {"doc": source},
+                    },
                 }
                 for doc_id, source in pending_upserts.items()
             ]
@@ -1520,6 +1781,9 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                 body = {
                     "mappings": {
                         "dynamic": True,
+                        "_meta": _workspace_index_meta(
+                            self.workspace, self.final_namespace
+                        ),
                         "properties": {
                             "__mirrored_id": {"type": "keyword"},
                             "status": {"type": "keyword"},
@@ -1542,6 +1806,16 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                     f"[{self.workspace}] Created doc status index: {self._index_name}"
                 )
             else:
+                # Ownership before any mapping mutation: never touch an index
+                # that turns out to belong to a different workspace. The
+                # trailing claim below still covers the freshly-created and
+                # lost-the-create-race paths.
+                await _claim_index_for_workspace(
+                    self.client,
+                    self._index_name,
+                    self.workspace,
+                    self.final_namespace,
+                )
                 await self._ensure_content_hash_mapping()
                 await self._ensure_scheduling_fields_mapping()
                 # Unconditional for every pre-existing index. Gating this on
@@ -1562,6 +1836,14 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error creating doc status index: {e}")
             raise
+
+        # Verify the index we just created (or attached to) is ours. The
+        # workspace-to-index-name mapping is lossy, so a differently-named
+        # workspace can resolve to this same index -- fail fast instead of
+        # silently sharing its data.
+        await _claim_index_for_workspace(
+            self.client, self._index_name, self.workspace, self.final_namespace
+        )
 
     async def _ensure_content_hash_mapping(self) -> None:
         """Add the content_hash keyword mapping to a pre-existing doc status index.
@@ -1868,7 +2150,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             )
             await _cooperative_yield(i)
         try:
-            # DocStatus needs refresh="wait_for" because get_docs_by_status
+            # DocStatus needs refresh="wait_for" because get_docs_by_statuses
             # (search-based) is called immediately after enqueue upserts.
             _, failed = await _run_chunked_async_bulk(
                 self.client,
@@ -1989,12 +2271,6 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             if strict:
                 raise
         return result
-
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents matching a specific processing status."""
-        return await self.get_docs_by_statuses([status])
 
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus], strict: bool = False
@@ -3089,7 +3365,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             ids = list(ids)
         try:
             # DocStatus needs refresh="wait_for" because downstream readers
-            # (get_docs_by_status, get_docs_paginated, etc.) are search-based
+            # (get_docs_by_statuses, get_docs_paginated, etc.) are search-based
             # and callers like _validate_and_fix_document_consistency() may
             # query immediately after deletion without index_done_callback().
             actions = [
@@ -3286,6 +3562,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 body = {
                     "mappings": {
                         "dynamic": True,
+                        "_meta": _workspace_index_meta(
+                            self.workspace, self.final_namespace
+                        ),
                         "properties": {
                             "entity_id": {"type": "keyword"},
                             "entity_type": {"type": "keyword"},
@@ -3316,6 +3595,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 body = {
                     "mappings": {
                         "dynamic": True,
+                        "_meta": _workspace_index_meta(
+                            self.workspace, self.final_namespace
+                        ),
                         "properties": {
                             "source_node_id": {"type": "keyword"},
                             "target_node_id": {"type": "keyword"},
@@ -3343,6 +3625,14 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         except RequestError as e:
             if "resource_already_exists_exception" not in str(e):
                 raise
+
+        # Runs before _migrate_edges_to_canonical_id_if_needed (see
+        # initialize) so a colliding deployment never reindexes another
+        # workspace's edges.
+        for index_name in (self._nodes_index, self._edges_index):
+            await _claim_index_for_workspace(
+                self.client, index_name, self.workspace, self.final_namespace
+            )
 
     async def _migrate_edges_to_canonical_id_if_needed(self) -> None:
         """One-time reindex of edge docs onto canonical (sorted-pair) ``_id``s.
@@ -4529,6 +4819,49 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error getting all labels: {e}")
             raise
 
+    async def iter_labels(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not self._indices_ready:
+            return
+        try:
+            await self._refresh_graph_indices_if_dirty(refresh_nodes=True)
+            pit = await self.client.create_pit(
+                index=self._nodes_index, params={"keep_alive": "1m"}
+            )
+            pit_id = pit["pit_id"]
+            try:
+                search_after = None
+                while True:
+                    body = {
+                        "query": {"match_all": {}},
+                        "_source": False,
+                        "size": min(batch_size, 10000),
+                        "pit": {"id": pit_id, "keep_alive": "1m"},
+                        "sort": _pit_sort_with_field("entity_id"),
+                    }
+                    if search_after:
+                        body["search_after"] = search_after
+                    response = await self.client.search(body=body)
+                    hits = response["hits"]["hits"]
+                    if not hits:
+                        break
+                    yield [hit["_id"] for hit in hits]
+                    search_after = hits[-1]["sort"]
+                    if len(hits) < min(batch_size, 10000):
+                        break
+            finally:
+                try:
+                    await self.client.delete_pit(body={"pit_id": [pit_id]})
+                except Exception:
+                    pass
+        except OpenSearchException as e:
+            if _is_missing_index_error(e):
+                self._mark_indices_missing()
+                return
+            logger.error(f"[{self.workspace}] Error iterating labels: {e}")
+            raise
+
     async def _collect_node_ids(
         self,
         limit: int,
@@ -4846,7 +5179,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 # buckets happened to come back.
                 #
                 # Exact WITHIN degree_map, which is itself approximate, so the
-                # ranking on this backend is too (#3613). Each aggregation above
+                # ranking on this backend is too. Each aggregation above
                 # returns only its own top max_nodes buckets, so an entity whose
                 # in- and out-degree each fall outside their respective top-N
                 # never reaches this sort however high its undirected degree is;
@@ -5298,6 +5631,56 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error getting all edges: {e}")
             raise
 
+    async def iter_edges(self, batch_size: int):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not self._indices_ready:
+            return
+        try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
+            pit = await self.client.create_pit(
+                index=self._edges_index, params={"keep_alive": "1m"}
+            )
+            pit_id = pit["pit_id"]
+            try:
+                search_after = None
+                while True:
+                    body = {
+                        "query": {"match_all": {}},
+                        "size": min(batch_size, 10000),
+                        "pit": {"id": pit_id, "keep_alive": "1m"},
+                        "sort": _pit_sort_with_composite_key(
+                            "source_node_id", "target_node_id"
+                        ),
+                    }
+                    if search_after:
+                        body["search_after"] = search_after
+                    response = await self.client.search(body=body)
+                    hits = response["hits"]["hits"]
+                    if not hits:
+                        break
+                    batch: list[dict] = []
+                    for hit in hits:
+                        edge = dict(hit["_source"])
+                        edge["source"] = edge.get("source_node_id")
+                        edge["target"] = edge.get("target_node_id")
+                        batch.append(edge)
+                    yield batch
+                    search_after = hits[-1]["sort"]
+                    if len(hits) < min(batch_size, 10000):
+                        break
+            finally:
+                try:
+                    await self.client.delete_pit(body={"pit_id": [pit_id]})
+                except Exception:
+                    pass
+        except OpenSearchException as e:
+            if _is_missing_index_error(e):
+                self._mark_indices_missing()
+                return
+            logger.error(f"[{self.workspace}] Error iterating edges: {e}")
+            raise
+
     async def _collect_isolated_labels(
         self, needed: int, connected: set[str]
     ) -> list[str]:
@@ -5549,7 +5932,7 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         self._max_batch_size = self.global_config["embedding_batch_num"]
         # Pending writes are flushed via _flush_pending_vector_ops() during
         # index_done_callback() / finalize(). This batches many small upsert()
-        # invocations into a single async_bulk roundtrip. See issue #2785.
+        # invocations into a single async_bulk roundtrip.
         self._pending_vector_docs: dict[str, _PendingVectorDoc] = {}
         self._pending_vector_deletes: set[str] = set()
         # Namespace-keyed lock (multi-process safe) is initialised in
@@ -5597,6 +5980,14 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
     async def _create_knn_index_if_not_exists(self):
         try:
             if await self.client.indices.exists(index=self._index_name):
+                # Ownership before compatibility: an index belonging to a
+                # different workspace must not be judged by our dimensions.
+                await _claim_index_for_workspace(
+                    self.client,
+                    self._index_name,
+                    self.workspace,
+                    self.final_namespace,
+                )
                 # Validate existing index dimension
                 try:
                     mapping = await self.client.indices.get_mapping(
@@ -5660,6 +6051,9 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
                         "created_at": {"type": "long"},
                     },
                     "dynamic": True,
+                    "_meta": _workspace_index_meta(
+                        self.workspace, self.final_namespace
+                    ),
                 },
             }
             await self.client.indices.create(index=self._index_name, body=body)
@@ -5674,6 +6068,14 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error creating k-NN index: {e}")
             raise
+
+        # Verify the index we just created (or attached to) is ours. The
+        # workspace-to-index-name mapping is lossy, so a differently-named
+        # workspace can resolve to this same index -- fail fast instead of
+        # silently sharing its data.
+        await _claim_index_for_workspace(
+            self.client, self._index_name, self.workspace, self.final_namespace
+        )
 
     async def finalize(self):
         """Flush pending writes and release the OpenSearch client connection.

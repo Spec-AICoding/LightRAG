@@ -17,7 +17,7 @@ from typing import (
     List,
     AsyncIterator,
 )
-from .utils import EmbeddingFunc, get_env_value
+from .utils import EmbeddingFunc, get_env_value, logger
 from .types import KnowledgeGraph
 from .exceptions import (
     StorageCapabilityError,
@@ -150,6 +150,17 @@ class QueryParam:
     """User-provided prompt for the query.
     Additional instructions for LLM. If provided, this will be injected into the prompt template.
     Its purpose is to let the user customize the way LLM generates the response.
+
+    The server may prepend a global prefix (``USER_PROMPT_PREFIX`` /
+    ``LightRAG.user_prompt_prefix``) to this value. **If this field is empty,
+    the prefix alone becomes the instructions sent to the LLM** -- an empty
+    ``user_prompt`` does not disable the prefix. Set
+    ``disable_user_prompt_prefix`` (declared at the end of this class) to opt
+    out instead.
+
+    Two paths do not receive the prefix: ``bypass`` mode ignores this field
+    entirely (empty or not), and a caller-supplied ``system_prompt`` without a
+    ``{user_prompt}`` placeholder silently drops it.
     """
 
     enable_rerank: bool = os.getenv("RERANK_BY_DEFAULT", "true").lower() == "true"
@@ -161,6 +172,20 @@ class QueryParam:
     """If True, includes reference list in the response for supported endpoints.
     This parameter controls whether the API response includes a references field
     containing citation information for the retrieved content.
+    """
+
+    # Declared last on purpose. QueryParam is a plain dataclass, so SDK callers
+    # may construct it positionally; inserting a field beside `user_prompt`
+    # would silently rebind every positional argument after it (a positional
+    # `False` meant for `enable_rerank` would land here instead). New fields
+    # belong at the end.
+    disable_user_prompt_prefix: bool = False
+    """Do not prepend the server-side global prompt prefix to ``user_prompt``.
+
+    The prefix is operator configuration: a request can only opt out of it, it
+    can never read or replace it. Default ``False``, i.e. the prefix applies --
+    including when ``user_prompt`` is empty, where the prefix alone becomes the
+    instructions. Set this to True to take full control of the final text.
     """
 
 
@@ -298,7 +323,7 @@ class BaseVectorStorage(StorageNameSpace, ABC):
 
         Multi-worker note:
             Backends that buffer writes in process memory (e.g.
-            OpenSearchVectorDBStorage as of #3043) keep the buffer
+            OpenSearchVectorDBStorage) keep the buffer
             process-local. In a multi-worker deployment (e.g.
             lightrag-gunicorn) other workers will not observe these writes
             until the writing worker has called index_done_callback().
@@ -389,6 +414,41 @@ class BaseVectorStorage(StorageNameSpace, ABC):
         pass
 
 
+def normalize_kv_create_time(value: Any) -> int:
+    """Coerce a stored ``create_time`` into the int the KV contract promises.
+
+    Stored rows are not always written by the current release: an older
+    LightRAG could store ``time.time()`` unrounded (a float), a hand-edited
+    ``JsonKVStorage`` file can carry ``null``, and external tooling can leave
+    the field a string. Every backend that preserves ``create_time`` across a
+    replacement upsert funnels the stored value through here, so the backends
+    agree on malformed input instead of each writing its own shape back.
+
+    ``None`` -- the documented "unknown" marker -- maps to ``0`` silently.
+    Anything that will not coerce is data corruption rather than a legacy
+    shape, so it is logged before falling back to ``0``.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        # bool is an int subclass, so int(True) would record 1. A boolean
+        # timestamp is corruption, not a legacy shape -- and OpenSearch's
+        # server-side equivalent cannot coerce it either, so both answer 0.
+        logger.warning(f"KV create_time is a boolean ({value!r}); recording 0")
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not a ValueError: JSON ``1e309`` decodes to float
+        # infinity, and ``int(inf)`` raises it. Without it here a single
+        # hand-edited row would abort the whole upsert instead of taking this
+        # documented fallback.
+        logger.warning(
+            f"KV create_time is not a number ({value!r}); recording 0 (unknown)"
+        )
+        return 0
+
+
 @dataclass
 class BaseKVStorage(StorageNameSpace, ABC):
     embedding_func: EmbeddingFunc
@@ -451,10 +511,45 @@ class BaseKVStorage(StorageNameSpace, ABC):
         1. Changes will be persisted to disk during the next index_done_callback
         2. update flags to notify other processes that data persistence is needed
 
+        Storage-managed timestamps (binding on every backend):
+            1. A key that does not exist yet is stamped with both
+               ``create_time`` and ``update_time``. Under concurrency the
+               FIRST creation defines ``create_time``: a backend whose insert
+               is not naturally atomic must make it so (Mongo's
+               ``$setOnInsert``, PG's ``ON CONFLICT``, Redis's ``SET ... NX``)
+               instead of letting the last writer's clock win.
+            2. A key that already exists keeps its stored ``create_time`` and
+               only advances ``update_time`` -- including when ``data``
+               replaces the whole value with business fields only, which is
+               what the chunk-tracking writers send.
+            3. A stored row carrying no ``create_time`` (written before the
+               field existed) records ``0`` = unknown. Never invent an
+               original timestamp for it: ``0`` is what every read path
+               already substitutes, so the row keeps the meaning it had.
+            4. A caller-supplied ``create_time`` is ignored on the update
+               path. The timestamp is storage-managed, so preserving it must
+               not depend on callers round-tripping metadata fields.
+            5. Stored values reach ``int`` through
+               :func:`normalize_kv_create_time` so the backends agree on
+               legacy and malformed shapes.
+
+            ``MongoKVStorage`` (``$setOnInsert``) and ``PGKVStorage``
+            (``ON CONFLICT ... DO UPDATE`` that never assigns
+            ``create_time``) are the reference implementations: the
+            conditional write belongs on the server, not in a client-side
+            read-modify-write: a client-side read-then-write cannot keep a
+            concurrent first insert or a concurrent delete from moving the
+            timestamp, and no later write repairs it, because every update
+            preserves what it finds. A backend without such a primitive
+            reconstructs one -- ``OpenSearchKVStorage`` with a
+            ``scripted_upsert`` bulk action, ``RedisKVStorage`` with a Lua
+            script that reads a bounded prefix and writes in the same step --
+            rather than reading whole values back.
+
         Multi-worker note:
             Backends that buffer writes in process memory (e.g.
-            OpenSearchKVStorage as of the KV-batching change derived from
-            #2822) keep the buffer process-local. In a multi-worker
+            OpenSearchKVStorage, since its KV writes were batched) keep the
+            buffer process-local. In a multi-worker
             deployment (e.g. lightrag-gunicorn) other workers will not
             observe these writes until the writing worker has called
             index_done_callback(). Callers that depend on cross-worker
@@ -495,6 +590,46 @@ class BaseGraphStorage(StorageNameSpace, ABC):
     """All operations related to edges in graph should be undirected."""
 
     embedding_func: EmbeddingFunc
+
+    # Whether this backend can lose an uncommitted in-memory mutation when a
+    # peer commit makes it reload. ``True`` means the backend
+    # holds the whole graph in process memory, commits it as one unit, and has
+    # no pending buffer or redo log to replay over a reloaded snapshot -- so
+    # concurrent writers on one workspace must be serialized above it.
+    # ``LightRAG._admin_write_gate`` keys off this: where it is ``True`` the
+    # admin graph writers take the workspace admin lock and the pipeline
+    # ``busy`` reservation; where it is ``False`` (every server-backed store,
+    # which has row/transaction-level concurrency of its own) they run
+    # unserialized, as before.
+    #
+    # ``ClassVar`` on purpose: the storage bases are dataclasses, so a bare
+    # annotated attribute would become an ``__init__`` field and change the
+    # constructor signature and field order of every backend.
+    requires_single_writer: ClassVar[bool] = False
+
+    def discard_uncommitted_mutations(self, reason: str) -> bool:
+        """Give up in-memory graph mutations no commit has published.
+
+        For a backend that buffers the whole graph in process memory
+        (``requires_single_writer``), an operation that dies between its
+        ``upsert_node`` / ``remove_nodes`` and its commit leaves those
+        mutations sitting in that buffer with nothing owing anything about
+        them, so the next unrelated commit publishes them -- making an
+        operation that was reported as FAILED durable after the fact. Called
+        by ``LightRAG._admin_write_gate`` on the one exit where the operation's
+        own ``except Exception`` handlers cannot run (a cancellation, including
+        the hold ceiling's), while the gate still holds the admin lock and the
+        pipeline reservation, so no other writer can be mid-mutation.
+
+        **Synchronous on purpose.** It runs on an already-cancelled task where
+        every ``await`` is a place the cleanup can be interrupted a second
+        time; a plain attribute write cannot be.
+
+        Returns True when something was actually given up (worth logging),
+        False when there was nothing unpublished. The default is False: a
+        server-backed store commits per statement and holds no such buffer.
+        """
+        return False
 
     @abstractmethod
     async def has_node(self, node_id: str) -> bool:
@@ -828,6 +963,20 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             A list of all node labels in the graph, sorted alphabetically
         """
 
+    async def iter_labels(self, batch_size: int) -> AsyncIterator[list[str]]:
+        """Yield all graph labels in bounded batches.
+
+        Whole-graph maintenance tools use this instead of ``get_all_labels`` so
+        their client-side memory does not grow with the graph. Backends must
+        override this method with native cursor, keyset, or in-memory graph
+        iteration; the default fails closed because collecting
+        ``get_all_labels`` and slicing it would violate that contract.
+        """
+        raise StorageCapabilityError(
+            f"{type(self).__name__} does not support bounded label iteration"
+        )
+        yield []  # pragma: no cover - make this an async generator
+
     @abstractmethod
     async def get_knowledge_graph(
         self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
@@ -892,7 +1041,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         admit in traversal order. A new backend should rank its levels where
         its query language makes that free, and is under no obligation to
         reshape a traversal to achieve it.
-        This is the resolution of issue #3612, not an outstanding gap in it.
+        This is a resolved decision, not an outstanding gap.
 
         **Known deviation -- PGGraphStorage (Apache AGE)** ranks the ``*`` view
         on ``degree DESC, v.id ASC``, the internal vertex id, not the label.
@@ -913,7 +1062,7 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         ``max_nodes``, so an entity whose in- and out-degree both fall outside
         their respective top-N never reaches the ranking however high its
         undirected degree is, and terms aggregations are count-approximate
-        across shards. Tracked in issue #3613; it needs a storage-shape change,
+        across shards. Not addressed; it needs a storage-shape change,
         not an ordering one.
 
         This constrains WHICH nodes survive truncation, not the order of
@@ -938,6 +1087,18 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Returns:
             A list of all edges, where each edge is a dictionary of its properties
         """
+
+    async def iter_edges(self, batch_size: int) -> AsyncIterator[list[dict]]:
+        """Yield all graph edges in bounded batches.
+
+        The returned dictionaries follow ``get_all_edges`` and carry
+        ``source`` and ``target``. See :meth:`iter_labels` for the fail-closed
+        compatibility rule.
+        """
+        raise StorageCapabilityError(
+            f"{type(self).__name__} does not support bounded edge iteration"
+        )
+        yield []  # pragma: no cover - make this an async generator
 
     @abstractmethod
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
@@ -1270,12 +1431,6 @@ class DocStatusStorage(BaseKVStorage, ABC):
     @abstractmethod
     async def get_status_counts(self) -> dict[str, int]:
         """Get counts of documents in each status"""
-
-    @abstractmethod
-    async def get_docs_by_status(
-        self, status: DocStatus
-    ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
 
     @abstractmethod
     async def get_docs_by_statuses(
@@ -1783,12 +1938,21 @@ class QueryResult:
         response_iterator: Streaming response iterator for streaming responses
         raw_data: Complete structured data including references and metadata
         is_streaming: Whether this is a streaming result
+        llm_generated: Whether the answering LLM actually wrote this result.
+            False for every result a query path produces WITHOUT calling it:
+            the canned ``PROMPTS["fail_response"]`` returned when no context
+            could be built, and the ``only_need_context`` / ``only_need_prompt``
+            debug outputs (retrieved context and constructed prompt). Consumers
+            that must label machine-written text (the WebUI's AI-content
+            notice) need this distinction, and no consumer can recover it from
+            the text alone.
     """
 
     content: Optional[str] = None
     response_iterator: Optional[AsyncIterator[str]] = None
     raw_data: Optional[Dict[str, Any]] = None
     is_streaming: bool = False
+    llm_generated: bool = True
 
     @property
     def reference_list(self) -> List[Dict[str, str]]:
