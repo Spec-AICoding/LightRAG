@@ -123,6 +123,17 @@ def _pre_acl_v2_answer_cache_key(
     refresh this when new key fields are added -- a later change that makes
     this snapshot match production again would silently re-legalize serving
     visibility-blind entries and must be a deliberate decision.
+
+    The snapshot carries the components the v2 era had already accumulated,
+    so it matches what a pre-v3 deployment actually holds on disk: the KG
+    chunk-selection settings (``related_chunk_number`` /
+    ``kg_chunk_pick_method``, added in PR #3877 because changing either
+    changes the retrieved context, and serving an answer cached under the
+    previous setting is a wrong answer) and the LLM identity. The naive
+    branch is untouched -- it does not carry the chunk-selection components.
+    The defaults below are written as literals on purpose: if ``DEFAULT_*``
+    ever moves, this snapshot must go red again rather than follow it
+    silently.
     """
     args = [
         "query-answer-cache-v2",
@@ -142,6 +153,18 @@ def _pre_acl_v2_answer_cache_key(
             param.user_prompt or "",
             param.enable_rerank,
             cfg.get("enable_content_headings", False),
+        ]
+    )
+    if keywords is not None:
+        args.extend(
+            [
+                "\n<kg_chunk_selection>\n",
+                cfg.get("related_chunk_number", 5),
+                cfg.get("kg_chunk_pick_method", "VECTOR"),
+            ]
+        )
+    args.extend(
+        [
             "\n<llm_identity>\n",
             serialize_llm_cache_identity(get_llm_cache_identity(cfg, "query")),
         ]
