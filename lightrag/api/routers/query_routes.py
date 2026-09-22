@@ -24,7 +24,14 @@ from lightrag.constants import (
 )
 from lightrag.query_validation import validate_query_not_empty, validate_rag_query
 from lightrag.utils import logger
+# fork-custom (query-acl): request-scoped identity for ACL seat filtering.
+from lightrag.acl_identity import reset_identity, set_identity
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# fork-custom (query-acl): recall-headroom factor applied to top_k when an
+# identity is present — the entities recall is seat-filtered but the
+# relationships recall is not, so extra seats compensate for dropped rows.
+ACL_RECALL_HEADROOM_FACTOR = 2
 
 
 class QueryRequest(BaseModel):
@@ -166,6 +173,28 @@ class QueryRequest(BaseModel):
         description="If True, enables streaming output. Defaults to False for /query, True for /query/stream.",
     )
 
+    # fork-custom (query-acl): the querying user's identity, forwarded by the
+    # caller and set on the request-scoped ContextVar for the duration of the
+    # query. Both absent (or empty) means public-only visibility (fail-closed).
+    user_emails: Optional[list[str]] = Field(
+        default=None,
+        description="The querying user's email addresses for ACL filtering.",
+    )
+
+    user_group_ids: Optional[list[str]] = Field(
+        default=None,
+        description="The querying user's group ids for ACL filtering.",
+    )
+
+    # fork-custom (query-acl): whether public documents are part of the
+    # visible set. False drops the ``is_public`` clause — the caller then
+    # sees only explicitly shared rows, and nothing when no identity
+    # dimensions are carried (fail-closed, no error).
+    include_public: bool = Field(
+        default=True,
+        description="Whether public documents are included in the results.",
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
@@ -262,7 +291,16 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "include_chunk_content", "include_progress"},
+            exclude={
+                "query",
+                "include_chunk_content",
+                "include_progress",
+                # fork-custom (query-acl): identity travels via the ContextVar,
+                # not via QueryParam (which would reject the unknown fields).
+                "user_emails",
+                "user_group_ids",
+                "include_public",
+            },
         )
 
         # Ensure `mode` and `stream` are set explicitly
@@ -591,12 +629,21 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 422: Request validation failed (e.g., query empty or too short)
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
+        # fork-custom (query-acl): publish the requester identity to the
+        # request-scoped ContextVar for the duration of this query.
+        acl_token = set_identity(
+                request.user_emails, request.user_group_ids, request.include_public
+            )
         try:
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
+            # fork-custom (query-acl): expand top_k for recall headroom.
+            if request.user_emails or request.user_group_ids:
+                if param.top_k is not None:
+                    param.top_k *= ACL_RECALL_HEADROOM_FACTOR
             # Unified approach: always use aquery_llm for both cases
             start_time = time.perf_counter()
             result = await rag.aquery_llm(request.query, param=param)
@@ -658,6 +705,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise internal_server_error(e)
+        finally:
+            reset_identity(acl_token)
 
     def _build_stream_generator(
         *,
@@ -985,10 +1034,20 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint is ideal for applications requiring flexible response delivery.
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
+        # fork-custom (query-acl): publish the requester identity to the
+        # request-scoped ContextVar for the duration of this query. The
+        # query task below inherits it via ``asyncio.create_task``.
+        acl_token = set_identity(
+                request.user_emails, request.user_group_ids, request.include_public
+            )
         try:
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
+            # fork-custom (query-acl): expand top_k for recall headroom.
+            if request.user_emails or request.user_group_ids:
+                if param.top_k is not None:
+                    param.top_k *= ACL_RECALL_HEADROOM_FACTOR
 
             from fastapi.responses import StreamingResponse
 
@@ -1110,6 +1169,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
             raise internal_server_error(e)
+        finally:
+            reset_identity(acl_token)
 
     @router.post(
         "/query/data",
@@ -1523,12 +1584,44 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint always includes references regardless of the include_references parameter,
             as structured data analysis typically requires source attribution.
         """
+        # fork-custom (query-acl): publish the requester identity to the
+        # request-scoped ContextVar for the duration of this query.
+        acl_token = set_identity(
+                request.user_emails, request.user_group_ids, request.include_public
+            )
+        # fork-custom (query-acl): request/response logs at DEBUG — silent at
+        # the default LOG_LEVEL=INFO, enabled by setting LOG_LEVEL=DEBUG.
+        logger.debug(
+            "[query/data] request: query=%r mode=%s top_k=%s chunk_top_k=%s "
+            "user_emails=%s user_group_ids=%s include_public=%s",
+            request.query,
+            request.mode,
+            request.top_k,
+            request.chunk_top_k,
+            request.user_emails,
+            request.user_group_ids,
+            request.include_public,
+        )
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
+            # fork-custom (query-acl): expand top_k for recall headroom.
+            if request.user_emails or request.user_group_ids:
+                if param.top_k is not None:
+                    param.top_k *= ACL_RECALL_HEADROOM_FACTOR
             response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
+                response_data = response.get("data") or {}
+                logger.debug(
+                    "[query/data] response: status=%s entities=%s relationships=%s "
+                    "chunks=%s references=%s",
+                    response.get("status"),
+                    len(response_data.get("entities") or []),
+                    len(response_data.get("relationships") or []),
+                    len(response_data.get("chunks") or []),
+                    len(response_data.get("references") or []),
+                )
                 return QueryDataResponse(**response)
             else:
                 # Handle unexpected response format
@@ -1541,5 +1634,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise internal_server_error(e)
+        finally:
+            reset_identity(acl_token)
 
     return router

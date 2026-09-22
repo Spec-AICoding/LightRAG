@@ -25,6 +25,9 @@ from ..constants import (
     MILVUS_SUBMIT_LIMIT,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+# fork-custom (query-acl): seat-filter expr and requester identity.
+from ..acl_expr import build_acl_expr
+from ..acl_identity import get_identity
 import pipmaster as pm
 
 if not pm.is_installed("pymilvus"):
@@ -226,7 +229,7 @@ MILVUS_PRIMARY_KEY_FIELDS = frozenset({"id"})
 # truncate-and-warn instead, so a single pathological legacy value cannot abort
 # the whole collection migration.
 MILVUS_IDENTITY_VARCHAR_FIELDS = frozenset(
-    {"id", "entity_name", "full_doc_id", "src_id", "tgt_id"}
+    {"id", "entity_name", "full_doc_id", "src_id", "tgt_id", "biz_doc_id"}
 )
 # Fields whose value is a GRAPH_FIELD_SEP-joined list of ids (chunk ids / file
 # paths). When such a value overflows we truncate on the last separator that
@@ -552,6 +555,39 @@ class MilvusIndexConfig:
         }
 
 
+# fork-custom (query-acl): schema capacity of the ACL ARRAY columns
+# (max_capacity=64 in both collection schemas).
+ACL_ARRAY_MAX_CAPACITY = 64
+ACL_ARRAY_ELEMENT_MAX_LENGTH = 512
+
+
+def _cap_acl_list(values: Any, record_id: str, label: str) -> list[str]:
+    """Deduplicate and cap an ACL list at the schema's ARRAY limits.
+
+    The seat snapshot is best-effort, so oversized entries are truncated
+    (or the list capped) with a warning instead of failing the batch; a
+    narrowed snapshot costs recall seats, never safety.
+    """
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for value in values or []:
+        if not value:
+            continue
+        value = value[:ACL_ARRAY_ELEMENT_MAX_LENGTH]
+        if value and value not in seen:
+            seen.add(value)
+            cleaned.append(value)
+    if len(cleaned) > ACL_ARRAY_MAX_CAPACITY:
+        logger.warning(
+            "ACL %s for %s exceeds ARRAY capacity %d; capping (seat snapshot only)",
+            label,
+            record_id,
+            ACL_ARRAY_MAX_CAPACITY,
+        )
+        cleaned = cleaned[:ACL_ARRAY_MAX_CAPACITY]
+    return cleaned
+
+
 @final
 @dataclass
 class MilvusVectorDBStorage(BaseVectorStorage):
@@ -746,6 +782,30 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
+                # fork-custom (query-acl): union ACL snapshot of all contributing
+                # documents' ACLs — serves the recall-seat filter only; the
+                # safety judgment stays with the graph union properties.
+                FieldSchema(
+                    name="acl_is_public",
+                    dtype=DataType.BOOL,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="acl_external_user_emails",
+                    dtype=DataType.ARRAY,
+                    element_type=DataType.VARCHAR,
+                    max_length=512,
+                    max_capacity=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="acl_external_user_group_ids",
+                    dtype=DataType.ARRAY,
+                    element_type=DataType.VARCHAR,
+                    max_length=512,
+                    max_capacity=64,
+                    nullable=True,
+                ),
             ]
             description = "LightRAG entities vector storage"
 
@@ -804,6 +864,37 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     max_length=varchar_limits["file_path"],
                     nullable=True,
                 ),
+                # fork-custom (biz_doc_id): single-value document ownership URL
+                FieldSchema(
+                    name="biz_doc_id",
+                    dtype=DataType.VARCHAR,
+                    max_length=varchar_limits["biz_doc_id"],
+                    nullable=True,
+                ),
+                # fork-custom (query-acl): document-level ACL snapshot — the
+                # judgment source for chunk filtering (expr on recall, collapse
+                # query on the source_id fallback, relation lineage anchoring).
+                FieldSchema(
+                    name="acl_is_public",
+                    dtype=DataType.BOOL,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="acl_external_user_emails",
+                    dtype=DataType.ARRAY,
+                    element_type=DataType.VARCHAR,
+                    max_length=512,
+                    max_capacity=64,
+                    nullable=True,
+                ),
+                FieldSchema(
+                    name="acl_external_user_group_ids",
+                    dtype=DataType.ARRAY,
+                    element_type=DataType.VARCHAR,
+                    max_length=512,
+                    max_capacity=64,
+                    nullable=True,
+                ),
             ]
             description = "LightRAG chunks vector storage"
 
@@ -848,7 +939,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "source_id": MILVUS_MAX_VARCHAR_BYTES,
             }
         if self.namespace.endswith("chunks"):
-            return {**base_fields, "full_doc_id": 64}
+            return {**base_fields, "full_doc_id": 64, "biz_doc_id": 1024}
         return base_fields
 
     def _get_migrated_metadata_field_limits(self) -> dict[str, int]:
@@ -863,7 +954,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "source_id": MILVUS_MAX_VARCHAR_BYTES,
             }
         if self.namespace.endswith("chunks"):
-            return {"content": MILVUS_MAX_VARCHAR_BYTES}
+            # fork-custom (biz_doc_id): registering the field here makes the
+            # automatic schema migration reconcile pre-existing collections.
+            return {"content": MILVUS_MAX_VARCHAR_BYTES, "biz_doc_id": 1024}
         return {}
 
     @staticmethod
@@ -1073,6 +1166,28 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         self._create_scalar_index_fallback("entity_name", "INVERTED")
 
+                    # fork-custom (query-acl): INVERTED indexes on the ACL
+                    # union-snapshot columns (seat-filter expr support).
+                    for acl_field in (
+                        "acl_is_public",
+                        "acl_external_user_emails",
+                        "acl_external_user_group_ids",
+                    ):
+                        try:
+                            acl_index = self._get_index_params()
+                            acl_index.add_index(
+                                field_name=acl_field, index_type="INVERTED"
+                            )
+                            self._client.create_index(
+                                collection_name=self.final_namespace,
+                                index_params=acl_index,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"[{self.workspace}] IndexParams method failed for {acl_field}: {e}"
+                            )
+                            self._create_scalar_index_fallback(acl_field, "INVERTED")
+
                 elif self.namespace.endswith("relationships"):
                     # Create indexes for relationship fields
                     try:
@@ -1122,6 +1237,43 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         )
                         self._create_scalar_index_fallback("full_doc_id", "INVERTED")
 
+                    try:
+                        biz_doc_id_index = self._get_index_params()
+                        biz_doc_id_index.add_index(
+                            field_name="biz_doc_id", index_type="INVERTED"
+                        )
+                        self._client.create_index(
+                            collection_name=self.final_namespace,
+                            index_params=biz_doc_id_index,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[{self.workspace}] IndexParams method failed for biz_doc_id: {e}"
+                        )
+                        self._create_scalar_index_fallback("biz_doc_id", "INVERTED")
+
+                    # fork-custom (query-acl): INVERTED indexes on the ACL
+                    # snapshot columns (seat-filter expr support).
+                    for acl_field in (
+                        "acl_is_public",
+                        "acl_external_user_emails",
+                        "acl_external_user_group_ids",
+                    ):
+                        try:
+                            acl_index = self._get_index_params()
+                            acl_index.add_index(
+                                field_name=acl_field, index_type="INVERTED"
+                            )
+                            self._client.create_index(
+                                collection_name=self.final_namespace,
+                                index_params=acl_index,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"[{self.workspace}] IndexParams method failed for {acl_field}: {e}"
+                            )
+                            self._create_scalar_index_fallback(acl_field, "INVERTED")
+
             else:
                 # Fallback to direct API calls if IndexParams is not available
                 logger.info(
@@ -1131,11 +1283,26 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 # Create scalar indexes using fallback
                 if self.namespace.endswith("entities"):
                     self._create_scalar_index_fallback("entity_name", "INVERTED")
+                    # fork-custom (query-acl): ACL union-snapshot indexes.
+                    for acl_field in (
+                        "acl_is_public",
+                        "acl_external_user_emails",
+                        "acl_external_user_group_ids",
+                    ):
+                        self._create_scalar_index_fallback(acl_field, "INVERTED")
                 elif self.namespace.endswith("relationships"):
                     self._create_scalar_index_fallback("src_id", "INVERTED")
                     self._create_scalar_index_fallback("tgt_id", "INVERTED")
                 elif self.namespace.endswith("chunks"):
                     self._create_scalar_index_fallback("full_doc_id", "INVERTED")
+                    self._create_scalar_index_fallback("biz_doc_id", "INVERTED")
+                    # fork-custom (query-acl): ACL snapshot indexes.
+                    for acl_field in (
+                        "acl_is_public",
+                        "acl_external_user_emails",
+                        "acl_external_user_group_ids",
+                    ):
+                        self._create_scalar_index_fallback(acl_field, "INVERTED")
 
             logger.info(
                 f"[{self.workspace}] Created indexes for collection: {self.namespace}"
@@ -1164,6 +1331,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "content": {"type": "VarChar"},
                 "source_id": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
+                # fork-custom (query-acl): union ACL snapshot columns.
+                "acl_is_public": {"type": "Bool"},
+                "acl_external_user_emails": {"type": "Array"},
+                "acl_external_user_group_ids": {"type": "Array"},
             }
         elif self.namespace.endswith("relationships"):
             specific_fields = {
@@ -1178,6 +1349,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "full_doc_id": {"type": "VarChar"},
                 "content": {"type": "VarChar"},
                 "file_path": {"type": "VarChar"},
+                "biz_doc_id": {"type": "VarChar"},
+                # fork-custom (query-acl): document ACL snapshot columns.
+                "acl_is_public": {"type": "Bool"},
+                "acl_external_user_emails": {"type": "Array"},
+                "acl_external_user_group_ids": {"type": "Array"},
             }
         else:
             specific_fields = {
@@ -2479,6 +2655,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             },
         }
 
+        # fork-custom (query-acl): ACL seat filter. Only collections whose
+        # meta_fields carry the ACL columns get the expr — the relationships
+        # collection has none (its judgment needs lineage data, see the
+        # filter hook), so it must never receive a filter referencing them.
+        acl_filter: str | None = None
+        if "acl_is_public" in self.meta_fields:
+            acl_filter = build_acl_expr(get_identity())
+
         results = await run_in_milvus_executor(
             self._client.search,
             collection_name=self.final_namespace,
@@ -2486,6 +2670,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             limit=top_k,
             output_fields=output_fields,
             search_params=search_params,
+            filter=acl_filter,
         )
         return [
             {
@@ -2496,6 +2681,114 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             }
             for dp in results[0]
         ]
+
+    async def query_acl_visible_ids(self, ids: list[str]) -> list[str]:
+        """fork-custom (query-acl): return the subset of ``ids`` whose rows
+        satisfy the ACL expr (the chunk lineage collapse query).
+
+        Used by the filter hook to judge chunk visibility in exactly one
+        place — the expr. Rows missing from the collection are invisible
+        (fail-closed). Only meaningful on collections with ACL columns.
+        """
+        if not ids:
+            return []
+
+        acl_filter = build_acl_expr(get_identity())
+        visible: list[str] = []
+        # Chunk the id list to keep the filter expression bounded (Milvus
+        # rejects oversized filters); 256 ids is far below the limit.
+        for start in range(0, len(ids), 256):
+            batch = ids[start : start + 256]
+            id_list = ", ".join(f'"{chunk_id}"' for chunk_id in batch)
+            filter_expr = f"(id in [{id_list}]) and ({acl_filter})"
+            results = await run_in_milvus_executor(
+                self._client.query,
+                collection_name=self.final_namespace,
+                filter=filter_expr,
+                output_fields=["id"],
+            )
+            visible.extend(row["id"] for row in results)
+        return visible
+
+    async def query_ids_by_biz_doc_id(self, biz_doc_id: str) -> list[str]:
+        """fork-custom (query-acl): ids of chunk rows whose ``biz_doc_id``
+        matches (used by the ``/acl/chunks`` update endpoint)."""
+        escaped = biz_doc_id.replace("\\", "\\\\").replace('"', '\\"')
+        results = await run_in_milvus_executor(
+            self._client.query,
+            collection_name=self.final_namespace,
+            filter=f'biz_doc_id == "{escaped}"',
+            output_fields=["id"],
+        )
+        return [row["id"] for row in results]
+
+    async def query_acl_snapshots_by_biz_doc_ids(
+        self, biz_doc_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """fork-custom (query-acl): one ACL snapshot per document.
+
+        Rows of the same document share the snapshot, so any row per
+        document suffices; the returned map keys are the ``biz_doc_id``
+        values and the values are ``{acl_is_public, acl_external_user_emails,
+        acl_external_user_group_ids}``.
+        """
+        acl_fields = (
+            "acl_is_public",
+            "acl_external_user_emails",
+            "acl_external_user_group_ids",
+        )
+        snapshots: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(biz_doc_ids), 256):
+            batch = biz_doc_ids[start : start + 256]
+            id_list = ", ".join(
+                '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                for value in batch
+            )
+            results = await run_in_milvus_executor(
+                self._client.query,
+                collection_name=self.final_namespace,
+                filter=f"(biz_doc_id in [{id_list}])",
+                output_fields=["biz_doc_id", *acl_fields],
+            )
+            for row in results:
+                doc = row.get("biz_doc_id")
+                if doc and doc not in snapshots:
+                    snapshots[doc] = {field: row.get(field) for field in acl_fields}
+        return snapshots
+
+    async def upsert_acl_fields(self, data: dict[str, dict[str, Any]]) -> None:
+        """fork-custom (query-acl): upsert ONLY the three ACL columns.
+
+        partial_update=True makes the upsert leave unspecified columns
+        untouched, so passing just id + ACL fields rewrites the seat snapshot
+        without touching content or embeddings. Without the flag the client
+        rejects the row ("Insert missed an field `vector`"). Lists are
+        deduplicated and capped at the schema's ARRAY capacity: the seat
+        snapshot is best-effort, and one oversized ACL must not fail the
+        whole batch.
+        """
+        if not data:
+            return
+        rows = []
+        for doc_id, acl in data.items():
+            rows.append(
+                {
+                    "id": doc_id,
+                    "acl_is_public": acl.get("acl_is_public"),
+                    "acl_external_user_emails": _cap_acl_list(
+                        acl.get("acl_external_user_emails"), doc_id, "emails"
+                    ),
+                    "acl_external_user_group_ids": _cap_acl_list(
+                        acl.get("acl_external_user_group_ids"), doc_id, "groups"
+                    ),
+                }
+            )
+        await run_in_milvus_executor(
+            self._client.upsert,
+            collection_name=self.final_namespace,
+            data=rows,
+            partial_update=True,
+        )
 
     @staticmethod
     def _build_upsert_batches(

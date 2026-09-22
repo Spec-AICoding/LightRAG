@@ -3,6 +3,7 @@ from __future__ import annotations
 import traceback
 import asyncio
 import contextvars
+import json
 import os
 import threading
 import time
@@ -663,6 +664,51 @@ def _run_sync(
         return loop.run_until_complete(coro_factory())
     finally:
         _SYNC_WRAPPER_DRIVES_INLINE.reset(inline_token)
+
+
+# fork-custom (biz_doc_id): extract the onyx document URL from a custom-chunk
+# JSON payload; anything else (plain text, non-dict JSON, missing/non-string
+# "id") yields "" so non-onyx content is stored as empty rather than dropped.
+def _extract_biz_doc_id(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if isinstance(payload, dict):
+        value = payload.get("id")
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+# fork-custom (query-acl): extract the flattened ACL snapshot from a custom-
+# chunk JSON payload's top-level "external_access"; anything else yields
+# all-None (null ACL = invisible under the recall expr, fail-closed) and
+# never raises. Field names mirror the Milvus column names.
+def _extract_acl(text: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "acl_is_public": None,
+        "acl_external_user_emails": None,
+        "acl_external_user_group_ids": None,
+    }
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return fields
+    if not isinstance(payload, dict):
+        return fields
+    access = payload.get("external_access")
+    if not isinstance(access, dict):
+        return fields
+    return {
+        "acl_is_public": bool(access.get("is_public")),
+        "acl_external_user_emails": [
+            str(e) for e in (access.get("external_user_emails") or []) if e
+        ],
+        "acl_external_user_group_ids": [
+            str(g) for g in (access.get("external_user_group_ids") or []) if g
+        ],
+    }
 
 
 @final
@@ -1844,7 +1890,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            # fork-custom (query-acl): ACL union-snapshot fields must be in
+            # meta_fields or the Milvus upsert path silently drops them.
+            meta_fields={
+                "entity_name",
+                "source_id",
+                "content",
+                "file_path",
+                "acl_is_public",
+                "acl_external_user_emails",
+                "acl_external_user_group_ids",
+            },
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
@@ -1856,7 +1912,17 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            # fork-custom (query-acl): ACL snapshot fields must be in
+            # meta_fields or the Milvus upsert path silently drops them.
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                "biz_doc_id",
+                "acl_is_public",
+                "acl_external_user_emails",
+                "acl_external_user_group_ids",
+            },
         )
 
         # Initialize document status storage
@@ -2646,6 +2712,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                                 "tokens": len(self.tokenizer.encode(content)),
                                 "chunk_order_index": index,
                                 "file_path": file_path,
+                                "biz_doc_id": _extract_biz_doc_id(content),
+                                # fork-custom (query-acl): document ACL snapshot
+                                # flattened onto every chunk row (null = fail-closed).
+                                **_extract_acl(content),
                             }
                             for index, (chunk_id, content, _) in enumerate(
                                 chunk_entries
@@ -2745,6 +2815,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         journal=journal,
                     )
 
+                    # fork-custom (query-acl): the batch's document ACL is the
+                    # union of its chunk ACLs; the merge folds it into the
+                    # entity seat snapshots (best-effort, authority = graph).
+                    from lightrag.acl_utils import union_acl
+
+                    doc_acl: dict[str, Any] | None = None
+                    for _, content, _ in chunk_entries:
+                        doc_acl = union_acl(doc_acl, _extract_acl(content))
+
                     # Stage 3: merge into the knowledge graph. In patch mode
                     # the merge must NOT touch the base document's
                     # full_entities/full_relations rows (passing None skips the
@@ -2772,6 +2851,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                             entity_chunks_storage=self.entity_chunks,
                             relation_chunks_storage=self.relation_chunks,
                             file_path=file_path,
+                            doc_acl=doc_acl,
                             truncation_tally=truncation_tally,
                             truncation_write_ahead=_journal_truncation_write_ahead,
                         )
@@ -4161,6 +4241,25 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     if all_entities_data or deduped_relationships:
                         global_config = self._build_global_config()
                     if all_entities_data:
+                        # fork-custom (query-acl): entity seat snapshot = union
+                        # of the graph node's existing union props with this
+                        # batch's chunk-ACL union (best-effort; authority stays
+                        # with the graph).
+                        from lightrag.acl_utils import (
+                            graph_node_acl_snapshot,
+                            union_acl,
+                        )
+
+                        batch_acl: dict[str, Any] | None = None
+                        for chunk_entry in all_chunks_data.values():
+                            batch_acl = union_acl(
+                                batch_acl, _extract_acl(chunk_entry["content"])
+                            )
+                        existing_node_acls = (
+                            await self.chunk_entity_relation_graph.get_nodes_batch(
+                                [dp["entity_name"] for dp in all_entities_data]
+                            )
+                        )
                         data_for_entities_vdb = {
                             compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
                                 "content": _truncate_vdb_content(
@@ -4173,6 +4272,12 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                                 "description": dp["description"],
                                 "entity_type": dp["entity_type"],
                                 "file_path": dp.get("file_path", "custom_kg"),
+                                **union_acl(
+                                    graph_node_acl_snapshot(
+                                        existing_node_acls.get(dp["entity_name"])
+                                    ),
+                                    batch_acl,
+                                ),
                             }
                             for dp in all_entities_data
                         }
@@ -4633,7 +4738,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             if data_param.mode == "naive":
                 no_result_message = "No relevant document chunks found."
             final_data: dict[str, Any] = {
-                "status": "failure",
+                "status": "success",
                 "message": no_result_message,
                 "data": {},
                 "metadata": {

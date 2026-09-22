@@ -279,6 +279,16 @@ class RedisConnectionManager:
                     decode_responses=True,
                     socket_timeout=SOCKET_TIMEOUT,
                     socket_connect_timeout=SOCKET_CONNECT_TIMEOUT,
+                    # Remote servers / NAT devices silently drop idle TCP
+                    # sessions; a stale pooled connection then dies inside
+                    # asyncio's transport with a bare TypeError (its _sock is
+                    # already None), which redis-py does not treat as a
+                    # disconnect — the dead connection stays pooled and every
+                    # later request fails. PING idle connections before reuse
+                    # so a dead link is swapped for a fresh one, and keep the
+                    # TCP socket alive to reduce idle drops in the first place.
+                    health_check_interval=25,
+                    socket_keepalive=True,
                 )
                 cls._pool_refs[redis_url] = 0
                 logger.info(f"Created shared Redis connection pool for {redis_url}")

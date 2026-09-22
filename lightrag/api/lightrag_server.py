@@ -49,6 +49,8 @@ from .config import (
 )
 from lightrag.utils import get_env_value
 from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
+# fork-custom (query-acl): filter-hook wiring — registered in create_app below.
+from lightrag.acl_filter import apply_acl_filter, register_filter_callback
 from lightrag.api import __api_version__
 from lightrag.utils import EmbeddingFunc
 from lightrag.constants import (
@@ -71,6 +73,8 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.s3_routes import create_s3_routes
+# fork-custom (query-acl): internal ACL-update endpoints for the push path.
+from lightrag.api.routers.acl_routes import create_acl_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.routers.ui_customization_routes import create_ui_customization_routes
 from lightrag.api.ui_customization import (
@@ -2535,6 +2539,19 @@ def create_app(args):
         )
     )
 
+    # fork-custom (query-acl): wire the filter hook (② collapse + ③
+    # authority) into the query path. The relationships recall carries no
+    # seat expr by design (its judgment needs chunk lineage), so without
+    # this hook relations and their graph-side endpoint entities are
+    # unfiltered. Registered here, on the main thread at call time, so
+    # request tasks inherit it — a lifespan set would not propagate.
+    # Conditional on the chunks VDB supporting the lineage collapse query
+    # (Milvus ACL columns); other backends keep the hook unset and their
+    # retrieval unchanged.
+    if callable(getattr(rag.chunks_vdb, "query_acl_visible_ids", None)):
+        register_filter_callback(apply_acl_filter)
+        logger.info("ACL filter hook registered (query-acl)")
+
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
@@ -2542,6 +2559,8 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
     app.include_router(create_s3_routes(rag, api_key))
+    # fork-custom (query-acl): internal ACL-update endpoints (push path).
+    app.include_router(create_acl_routes(rag, api_key))
     # Public read-only customization surface — registered unconditionally:
     # without a bundle it answers 200 {"customized": false, ...}.
     app.include_router(

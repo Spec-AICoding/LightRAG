@@ -11,6 +11,13 @@ what keeps ``_ANSWER_CACHE_POLICY_VERSION`` at v2: with no prefix configured
 the composed text is byte-identical to the old value, so every entry written
 before this feature existed still hits. These tests pin both halves.
 
+A later change (fork-custom query-acl) appended the requester ACL identity
+as a NEW component and bumped the policy version to v3: a v2 entry may hold
+an answer built under another requester's visibility, so it must never be
+served. The two "pre-feature entries still hit" tests were therefore flipped
+to "pre-ACL entries no longer hit" — the frozen snapshot below now plays the
+role of the legacy v2 composition.
+
 ``disable_user_prompt_prefix`` is deliberately NOT a key component of its own:
 it acts only through the composed text, so a disabled request with a prefix
 configured must share an entry with a request that never had one.
@@ -101,19 +108,21 @@ def _answer_cache_keys(cache: _FakeKVStorage) -> list[str]:
     return [key for key in cache._store if ":query:" in key]
 
 
-def _preprefix_answer_cache_key(
+def _pre_acl_v2_answer_cache_key(
     param: QueryParam,
     cfg: dict,
     *,
     keywords: tuple[str, str] | None = None,
 ) -> str:
-    """Frozen snapshot of the answer-cache key as composed BEFORE this feature.
+    """Frozen snapshot of the answer-cache key as composed under policy v2.
 
     Deliberately duplicates the historical argument list rather than reusing
-    production code: the point is to prove an entry written by the old code is
-    still served when no prefix is configured. Do NOT refresh this when new key
-    fields are added -- if a later change makes this miss, that change costs
-    every deployment its warm answer cache and must be a deliberate decision.
+    production code: the point is to prove an entry written before the ACL
+    identity component joined the key (v3) is NOT served anymore, because it
+    may hold an answer built under another requester's visibility. Do NOT
+    refresh this when new key fields are added -- a later change that makes
+    this snapshot match production again would silently re-legalize serving
+    visibility-blind entries and must be a deliberate decision.
     """
     args = [
         "query-answer-cache-v2",
@@ -437,31 +446,31 @@ async def test_disabled_prefix_keeps_the_prefix_out_of_the_prompt(
 
 
 # ---------------------------------------------------------------------------
-# The invariant: an unconfigured prefix invalidates nothing.
+# The invariant: entries written before the ACL identity component never hit.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_naive_entry_written_before_the_prefix_feature_still_hits():
+async def test_naive_entry_written_before_the_acl_component_is_not_served():
     cache = _FakeKVStorage()
     model = _RecordingModel()
     cfg = _query_global_config(model)
     param = _naive_param(user_prompt=USER_PROMPT)
 
-    cache._store[_preprefix_answer_cache_key(param, cfg)] = {
-        "return": "PRE-PREFIX-ANSWER",
+    cache._store[_pre_acl_v2_answer_cache_key(param, cfg)] = {
+        "return": "STALE-V2-ANSWER",
         "create_time": 1,
     }
 
     result = await _run_naive(param, cfg, cache)
-    assert result.content == "PRE-PREFIX-ANSWER"
-    assert model.calls == 0
+    assert result.content == "answer-1"
+    assert model.calls == 1
 
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_kg_entry_written_before_the_prefix_feature_still_hits(
+async def test_kg_entry_written_before_the_acl_component_is_not_served(
     stub_query_context,
 ):
     cache = _FakeKVStorage()
@@ -469,14 +478,16 @@ async def test_kg_entry_written_before_the_prefix_feature_still_hits(
     cfg = _query_global_config(model)
     param = _kg_param(user_prompt=USER_PROMPT)
 
-    cache._store[_preprefix_answer_cache_key(param, cfg, keywords=("", "Tesla"))] = {
-        "return": "PRE-PREFIX-ANSWER",
+    cache._store[
+        _pre_acl_v2_answer_cache_key(param, cfg, keywords=("", "Tesla"))
+    ] = {
+        "return": "STALE-V2-ANSWER",
         "create_time": 1,
     }
 
     result = await _run_kg(param, cfg, cache)
-    assert result.content == "PRE-PREFIX-ANSWER"
-    assert model.calls == 0
+    assert result.content == "answer-1"
+    assert model.calls == 1
 
 
 @pytest.mark.offline
@@ -494,7 +505,7 @@ async def test_configured_prefix_does_not_serve_a_pre_prefix_entry(
     p = param(user_prompt=USER_PROMPT)
 
     keywords = ("", "Tesla") if p.mode == "local" else None
-    cache._store[_preprefix_answer_cache_key(p, cfg, keywords=keywords)] = {
+    cache._store[_pre_acl_v2_answer_cache_key(p, cfg, keywords=keywords)] = {
         "return": "PRE-PREFIX-ANSWER",
         "create_time": 1,
     }

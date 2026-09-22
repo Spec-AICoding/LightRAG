@@ -16,6 +16,9 @@ from lightrag.exceptions import (
     IndexFlushError,
     PipelineCancelledException,
 )
+# fork-custom (query-acl): ACL snapshot union helpers for the entity seat
+# snapshots written during the merge.
+from lightrag.acl_utils import graph_node_acl_snapshot, union_acl
 from lightrag.utils import (
     logger,
     compute_mdhash_id,
@@ -1811,6 +1814,11 @@ async def _rebuild_single_entity(
                     "description": final_description,
                     "entity_type": entity_type,
                     "file_path": updated_entity_data["file_path"],
+                    # fork-custom (query-acl): carry the graph's union ACL
+                    # properties (defaults to all-None when the node has
+                    # none) so a rebuild never silently erases the seat
+                    # snapshot the row already carried.
+                    **graph_node_acl_snapshot(current_entity),
                 }
             }
 
@@ -2278,6 +2286,10 @@ async def _rebuild_single_relationship(
                         "source_id": node_source_id,
                         "entity_type": "UNKNOWN",
                         "file_path": node_file_path,
+                        # fork-custom (query-acl): rebuilt endpoint nodes
+                        # carry the ACL fields with all-None defaults
+                        # (null ACL stays invisible, fail-closed).
+                        **graph_node_acl_snapshot(None),
                     }
                 }
                 if entities_vdb is not None
@@ -2441,6 +2453,9 @@ async def _merge_nodes_then_upsert(
     truncation_tally: TokenLimitTruncationTally | None = None,
     truncation_write_ahead: Callable[[TokenLimitTruncationTally], Awaitable[None]]
     | None = None,
+    # fork-custom (query-acl): batch document ACL folded into the entity
+    # seat snapshot (best-effort, authority stays on the graph).
+    doc_acl: dict | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
     if status_logger is None:
@@ -2755,6 +2770,13 @@ async def _merge_nodes_then_upsert(
                     "content": entity_content,
                     "source_id": source_id,
                     "file_path": file_path,
+                    # fork-custom (query-acl): seat snapshot = union of the
+                    # node's existing graph union props with the batch
+                    # document ACL (best-effort, authority stays on the graph).
+                    **union_acl(
+                        graph_node_acl_snapshot(already_node),
+                        doc_acl,
+                    ),
                 }
             }
 
@@ -2798,6 +2820,9 @@ async def _merge_edges_then_upsert(
     truncation_tally: TokenLimitTruncationTally | None = None,
     truncation_write_ahead: Callable[[TokenLimitTruncationTally], Awaitable[None]]
     | None = None,
+    # fork-custom (query-acl): batch document ACL folded into the endpoint
+    # entities' seat snapshots (best-effort, authority stays on the graph).
+    doc_acl: dict | None = None,
 ):
     if status_logger is None:
         # Fallback for direct callers that pass pipeline_status only; a
@@ -3194,6 +3219,10 @@ async def _merge_edges_then_upsert(
                             "source_id": source_id,
                             "entity_type": "UNKNOWN",
                             "file_path": file_path,
+                            # fork-custom (query-acl): seat snapshot = the
+                            # batch document ACL (new entity has no prior
+                            # union; best-effort, authority stays on the graph).
+                            **union_acl(None, doc_acl),
                         }
                     }
 
@@ -3337,6 +3366,14 @@ async def _merge_edges_then_upsert(
                                 ),
                                 "file_path": existing_node.get(
                                     "file_path", "unknown_source"
+                                ),
+                                # fork-custom (query-acl): seat snapshot =
+                                # union of the node's existing graph union
+                                # props with the batch document ACL
+                                # (best-effort, authority stays on the graph).
+                                **union_acl(
+                                    graph_node_acl_snapshot(existing_node),
+                                    doc_acl,
                                 ),
                             }
                         }
@@ -3529,6 +3566,11 @@ async def merge_nodes_and_edges(
     current_file_number: int = 0,
     total_files: int = 0,
     file_path: str = "unknown_source",
+    # fork-custom (query-acl): the batch's document-level ACL (union of its
+    # chunk ACLs, Milvus column names). Folded into the entity seat snapshots
+    # on every entity write in this merge; None means "no ACL data" (rows stay
+    # null = fail-closed invisible until a push recompute fills them).
+    doc_acl: dict | None = None,
     on_anchors_durable: Callable[[], Awaitable[None]] | None = None,
     truncation_tally: TokenLimitTruncationTally | None = None,
     truncation_write_ahead: Callable[[TokenLimitTruncationTally], Awaitable[None]]
@@ -3762,6 +3804,7 @@ async def merge_nodes_and_edges(
                             status_logger=status_logger,
                             truncation_tally=summary_tally,
                             truncation_write_ahead=truncation_write_ahead,
+                            doc_acl=doc_acl,
                         )
 
                         return entity_data
@@ -3856,6 +3899,7 @@ async def merge_nodes_and_edges(
                             status_logger=status_logger,
                             truncation_tally=summary_tally,
                             truncation_write_ahead=truncation_write_ahead,
+                            doc_acl=doc_acl,
                         )
 
                         if edge_data is None:
@@ -4618,9 +4662,12 @@ async def extract_entities(
 # under a key whose semantics have moved. v2 retires every entry written before
 # the _answer_cache_kv bypass below: such an entry may hold history-conditioned
 # text filed under a history-blind key, and entries record no history, so a
-# tainted entry cannot be told apart from a clean one. Only the answer cache is
-# versioned; keyword/extract/summary entries never see conversation_history.
-_ANSWER_CACHE_POLICY_VERSION = "query-answer-cache-v2"
+# tainted entry cannot be told apart from a clean one. v3 retires every entry
+# written before the ACL identity component (fork-custom query-acl) joined the
+# key: an old entry may hold an answer built under another requester's
+# visibility. Only the answer cache is versioned; keyword/extract/summary
+# entries never see conversation_history.
+_ANSWER_CACHE_POLICY_VERSION = "query-answer-cache-v3"
 
 
 def _answer_cache_kv(
@@ -4804,6 +4851,12 @@ async def kg_query(
 
     # Handle cache
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
+    # fork-custom (query-acl): the requester identity shapes the visible
+    # context and therefore the answer — pin the entry to it so cache
+    # entries never cross visibility boundaries (local import mirrors the
+    # filter-hook import below).
+    from lightrag.acl_identity import get_identity, serialize_acl_identity
+
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
@@ -4830,6 +4883,8 @@ async def kg_query(
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
+        "\n<acl_identity>\n",
+        serialize_acl_identity(get_identity()),
     )
 
     cached_result = await handle_cache(
@@ -6028,6 +6083,20 @@ async def _build_query_context(
         query_embedding=search_result["query_embedding"],
     )
 
+    # fork-custom (query-acl): invoke the ContextVar-registered filter
+    # callback (② collapse + ③ authority) when set; unset by default, so
+    # upstream behavior is unchanged. Runs post-recall, before the chunk
+    # truncation in Stage 4.
+    from lightrag.acl_filter import get_filter_callback
+
+    acl_filter_callback = get_filter_callback()
+    if acl_filter_callback is not None:
+        truncation_result, merged_chunks = await acl_filter_callback(
+            truncation_result=truncation_result,
+            merged_chunks=merged_chunks,
+            chunks_vdb=chunks_vdb,
+        )
+
     if (
         not merged_chunks
         and not truncation_result["entities_context"]
@@ -6862,6 +6931,12 @@ async def naive_query(
 
     # Handle cache
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
+    # fork-custom (query-acl): the requester identity shapes the visible
+    # context and therefore the answer — pin the entry to it so cache
+    # entries never cross visibility boundaries (local import mirrors the
+    # filter-hook import below).
+    from lightrag.acl_identity import get_identity, serialize_acl_identity
+
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
@@ -6886,6 +6961,8 @@ async def naive_query(
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
+        "\n<acl_identity>\n",
+        serialize_acl_identity(get_identity()),
     )
     cached_result = await handle_cache(
         answer_cache_kv, args_hash, user_query, query_param.mode, cache_type="query"

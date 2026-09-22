@@ -269,6 +269,13 @@ async def rebuild_entities_vdb(
             "source_id": node.get("source_id") or "",
             "description": description,
             "file_path": node.get("file_path") or "",
+            # fork-custom (query-acl): pass through the graph's union ACL
+            # snapshot; explicit defaults when the graph carries none.
+            "acl_is_public": node.get("acl_is_public") or False,
+            "acl_external_user_emails": node.get("acl_external_user_emails")
+            or [],
+            "acl_external_user_group_ids": node.get("acl_external_user_group_ids")
+            or [],
         }
 
     stats["prepared"] = len(payloads)
@@ -451,6 +458,12 @@ async def rebuild_chunks_vdb(
             payload.pop("_id", None)
             payload.setdefault("full_doc_id", "")
             payload.setdefault("file_path", "")
+            payload.setdefault("biz_doc_id", "")
+            # fork-custom (query-acl): pass through the record's ACL snapshot;
+            # explicit defaults when the KV record predates ACL support.
+            payload.setdefault("acl_is_public", False)
+            payload.setdefault("acl_external_user_emails", [])
+            payload.setdefault("acl_external_user_group_ids", [])
             batch_payload[chunk_id] = payload
 
         stats["prepared"] += len(batch_payload)
@@ -705,7 +718,17 @@ class RebuildTool:
             workspace=self.workspace,
             global_config=self.global_config,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            # fork-custom (query-acl): ACL union-snapshot fields must be in
+            # meta_fields or the Milvus upsert path silently drops them.
+            meta_fields={
+                "entity_name",
+                "source_id",
+                "content",
+                "file_path",
+                "acl_is_public",
+                "acl_external_user_emails",
+                "acl_external_user_group_ids",
+            },
         )
         self.relationships_vdb = vector_cls(
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
@@ -719,7 +742,16 @@ class RebuildTool:
             workspace=self.workspace,
             global_config=self.global_config,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            # fork-custom (query-acl): ACL snapshot fields must be in
+            # meta_fields or the Milvus upsert path silently drops them.
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                "acl_is_public",
+                "acl_external_user_emails",
+                "acl_external_user_group_ids",
+            },
         )
         self.text_chunks = kv_cls(
             namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
